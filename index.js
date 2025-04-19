@@ -38,33 +38,12 @@ const activeOperations = new Set();
 client.once('ready', async () => {
   console.log(`Bot is ready! Logged in as ${client.user.tag}`);
   
-  // Check if database exists and initialize
-  const dbExists = monitor.checkDatabaseExists();
-  console.log(`Database exists: ${dbExists}`);
-  
   try {
-    await monitor.initializeDatabase();
-    console.log('Database initialized');
-    
-    // Start processing the message cache
+    // Just start the message cache processing, but don't initialize DB yet
     monitor.processMessageCache();
-    
-    // If database existed, load channels that were being fetched
-    if (dbExists) {
-      const fetchedChannels = await monitor.getFetchedChannels();
-      console.log(`Found ${fetchedChannels.length} channels that have been fetched or are being fetched`);
-      
-      // Pre-populate the fetching sets for monitoring
-      for (const channel of fetchedChannels) {
-        if (channel.fetchCompleted === 1) {
-          console.log(`Channel ${channel.id} (${channel.name}) fetching is complete`);
-        } else {
-          console.log(`Channel ${channel.id} (${channel.name}) fetching is in progress`);
-        }
-      }
-    }
+    console.log('Message cache processing started');
   } catch (error) {
-    console.error('Error initializing database:', error);
+    console.error('Error starting message cache processing:', error);
   }
 });
 
@@ -329,6 +308,15 @@ client.on('messageCreate', async (message) => {
     try {
       const subCommand = args[1]?.toLowerCase();
       
+      // Initialize the database with this guild info to create a guild-specific DB file
+      try {
+        await monitor.initializeDatabase(message.guild);
+        console.log(`Database initialized for guild ${message.guild.name} (${message.guild.id})`);
+        console.log(`Using database: ${monitor.getCurrentDatabasePath()}`);
+      } catch (dbError) {
+        console.error('Error initializing database:', dbError);
+      }
+      
       if (!subCommand || subCommand === 'export') {
         // Export guild data
         await exportGuild.handleExportGuild(message, client);
@@ -361,7 +349,7 @@ client.on('messageCreate', async (message) => {
 
 // Login to Discord
 console.log('Starting Discord bot...');
-console.log(`Current Date and Time (UTC): 2025-04-19 11:44:58`);
+console.log(`Current Date and Time (UTC): ${getFormattedDateTime()}`);
 console.log(`Current User's Login: noname9006`);
 client.login(process.env.DISCORD_TOKEN).catch(error => {
   console.error('Failed to login:', error);

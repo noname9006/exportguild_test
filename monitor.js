@@ -9,31 +9,69 @@ let db = null;
 let dbInitialized = false;
 let fetchingInProgress = new Set(); // Set of channel IDs being fetched
 let fetchingComplete = new Set(); // Set of channel IDs that completed fetching
+let currentDbPath = null; // Store the current database path
 
 // Message cache with timestamps
 const messageCache = new Map(); // Map of messageId -> { message, timestamp }
 
+/**
+ * Generates a database filename with guild name, ID and creation date
+ * @param {Object} guild - The Discord guild object
+ * @returns {String} - The generated database filename
+ */
+function generateDbFilename(guild) {
+  if (!guild) {
+    return 'exportguild.db'; // Default filename if no guild provided
+  }
+  
+  // Sanitize guild name for filename usage
+  const sanitizedGuildName = guild.name.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+  
+  // Get current date in YYYY-MM-DD HH-MM-SS format
+  const now = new Date();
+  const dateStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`;
+  const timeStr = `${String(now.getUTCHours()).padStart(2, '0')}-${String(now.getUTCMinutes()).padStart(2, '0')}-${String(now.getUTCSeconds()).padStart(2, '0')}`;
+  
+  // Create filename in format: guild-name-guildId-YYYY-MM-DD-HH-MM-SS.db
+  return `${sanitizedGuildName}-${guild.id}-${dateStr}-${timeStr}.db`;
+}
+
 // Check if database exists on startup
-function checkDatabaseExists() {
-  const dbPath = path.join(process.cwd(), 'exportguild.db');
-  return fs.existsSync(dbPath);
+function checkDatabaseExists(guild = null) {
+  if (guild) {
+    // Create database name with guild info
+    currentDbPath = path.join(process.cwd(), generateDbFilename(guild));
+    return false; // Always create a new DB for each guild operation
+  } else {
+    // Check for default database for backward compatibility
+    const defaultPath = path.join(process.cwd(), 'exportguild.db');
+    currentDbPath = defaultPath; // Set the default path
+    return fs.existsSync(defaultPath);
+  }
 }
 
 // Initialize database
-function initializeDatabase() {
+function initializeDatabase(guild = null) {
   return new Promise((resolve, reject) => {
-    const dbPath = path.join(process.cwd(), 'exportguild.db');
-    const dbExists = fs.existsSync(dbPath);
+    // Determine database path based on guild info
+    const dbExists = checkDatabaseExists(guild);
+    
+    // At this point currentDbPath should be set
+    if (!currentDbPath) {
+      currentDbPath = path.join(process.cwd(), 'exportguild.db');
+    }
+    
+    console.log(`Initializing database at: ${currentDbPath}`);
     
     // Connect to SQLite database (creates file if it doesn't exist)
-    db = new sqlite3.Database(dbPath, (err) => {
+    db = new sqlite3.Database(currentDbPath, (err) => {
       if (err) {
         console.error('Error connecting to database:', err);
         reject(err);
         return;
       }
       
-      console.log(`Connected to database at ${dbPath}`);
+      console.log(`Connected to database at ${currentDbPath}`);
       
       // If database already existed, we're done
       if (dbExists) {
@@ -82,13 +120,75 @@ function initializeDatabase() {
             return;
           }
           
-          console.log('Database initialized successfully');
-          dbInitialized = true;
-          resolve(true);
+          // Add metadata table for guild information
+          db.run(`
+            CREATE TABLE IF NOT EXISTS guild_metadata (
+              key TEXT PRIMARY KEY,
+              value TEXT
+            )
+          `, (err) => {
+            if (err) {
+              console.error('Error creating guild_metadata table:', err);
+              reject(err);
+              return;
+            }
+            
+            // If guild is provided, store metadata
+            if (guild) {
+              // Store guild info in metadata
+              const timestamp = new Date().toISOString();
+              const metadataEntries = [
+                { key: 'guild_id', value: guild.id },
+                { key: 'guild_name', value: guild.name },
+                { key: 'creation_date', value: timestamp }
+              ];
+              
+              // Insert all metadata entries
+              const insertPromises = metadataEntries.map(entry => {
+                return new Promise((resolve, reject) => {
+                  db.run(
+                    'INSERT INTO guild_metadata (key, value) VALUES (?, ?)',
+                    [entry.key, entry.value],
+                    function(err) {
+                      if (err) {
+                        console.error(`Error storing metadata ${entry.key}:`, err);
+                        reject(err);
+                      } else {
+                        resolve();
+                      }
+                    }
+                  );
+                });
+              });
+              
+              // Wait for all inserts to complete
+              Promise.all(insertPromises)
+                .then(() => {
+                  console.log('Guild metadata stored in database');
+                  dbInitialized = true;
+                  resolve(true);
+                })
+                .catch(err => {
+                  console.error('Error storing guild metadata:', err);
+                  // Still mark as initialized even if metadata failed
+                  dbInitialized = true;
+                  resolve(true);
+                });
+            } else {
+              console.log('Database initialized successfully');
+              dbInitialized = true;
+              resolve(true);
+            }
+          });
         });
       });
     });
   });
+}
+
+// Get current database path
+function getCurrentDatabasePath() {
+  return currentDbPath || path.join(process.cwd(), 'exportguild.db');
 }
 
 // Add message to cache with current timestamp
@@ -343,6 +443,12 @@ function checkForDuplicates() {
 // Get channels that have been fetched
 async function getFetchedChannels() {
   return new Promise((resolve, reject) => {
+    if (!db) {
+      console.log("Database not initialized, returning empty array");
+      resolve([]);
+      return;
+    }
+    
     const sql = `
       SELECT id, name, fetchStarted, fetchCompleted, lastMessageId, lastFetchTimestamp
       FROM channels
@@ -389,5 +495,7 @@ module.exports = {
   checkForDuplicates,
   getFetchedChannels,
   shouldMonitorChannel,
-  extractMessageMetadata
+  extractMessageMetadata,
+  generateDbFilename,
+  getCurrentDatabasePath
 };
