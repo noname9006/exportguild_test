@@ -1,5 +1,4 @@
 // exportguild.js - Functions for exporting Discord guild data
-const fs = require('fs');
 const path = require('path');
 const { 
   PermissionFlagsBits,
@@ -12,8 +11,8 @@ const monitor = require('./monitor');
 const excludedChannelsArray = config.getConfig('excludedChannels', 'EX_CHANNELS');
 const excludedChannels = new Set(excludedChannelsArray);
 
-// Export threshold - how many messages to process before auto-save
-const EXPORT_THRESHOLD = config.getConfig('exportThreshold', 'METADATA_EXPORT_THRESHOLD');
+// Database batch size - how many messages to insert at once
+const DB_BATCH_SIZE = config.getConfig('dbBatchSize', 'DB_BATCH_SIZE') || 100;
 
 // Memory limit in MB
 const MEMORY_LIMIT_MB = config.getConfig('memoryLimitMB', 'MEMORY_LIMIT_MB');
@@ -24,9 +23,6 @@ const MEMORY_SCALE_FACTOR = 0.85;
 
 // Memory check frequency in milliseconds
 const MEMORY_CHECK_INTERVAL = config.getConfig('memoryCheckInterval', 'MEMORY_CHECK_INTERVAL');
-
-// Auto-save interval in milliseconds
-const AUTO_SAVE_INTERVAL = config.getConfig('autoSaveInterval', 'AUTO_SAVE_INTERVAL');
 
 // Maximum concurrent API requests
 const MAX_CONCURRENT_REQUESTS = 10;
@@ -150,33 +146,6 @@ async function checkAndHandleMemoryUsage(exportState, trigger = 'MANUAL') {
     return true;
   }
   return false;
-}
-
-// Function to verify export completeness
-async function verifyExportCompleteness(exportState) {
-  // Count lines in the file
-  let lineCount = 0;
-  try {
-    // Use manual counting to count lines
-    const data = fs.readFileSync(exportState.filepath, 'utf8');
-    lineCount = data.split('\n').filter(line => line.trim().length > 0).length;
-    
-    console.log(`File verification: ${lineCount} lines in file, ${exportState.messagesWrittenToFile} messages reported written`);
-    
-    // Check for messages that may have been processed but not written
-    const nonMessageLines = 2 + exportState.totalChannels; // 2 for start/end metadata + channel metadata
-    const expectedMessageLines = exportState.messagesWrittenToFile;
-    const expectedTotalLines = nonMessageLines + expectedMessageLines;
-    
-    if (lineCount !== expectedTotalLines) {
-      console.error(`DISCREPANCY: File line count (${lineCount}) doesn't match expected count (${expectedTotalLines})`);
-      console.error(`Expected ${nonMessageLines} non-message lines + ${expectedMessageLines} message lines`);
-    }
-  } catch (error) {
-    console.error('Error during file verification:', error);
-  }
-  
-  return lineCount;
 }
 
 async function fetchVisibleChannels(guild) {
@@ -307,23 +276,6 @@ async function processChannelsInParallel(channels, exportState, statusMessage, g
   }
 }
 
-// Function to write a message to the file
-async function writeMessageToFile(message, exportState) {
-  try {
-    // Add channel ID and message type to the message object
-    message.type = 'message';
-    
-    // Write the message as NDJSON format (one JSON object per line)
-    fs.appendFileSync(exportState.filepath, JSON.stringify(message) + '\n');
-    exportState.messagesWrittenToFile++;
-    return true;
-  } catch (error) {
-    console.error('Error writing message to file:', error);
-    exportState.messageWriteErrors++;
-    return false;
-  }
-}
-
 async function fetchMessagesFromChannel(channel, exportState, statusMessage, guild) {
   if (!channel.isTextBased()) {
     console.log(`Skipping non-text channel: ${channel.name}`);
@@ -336,6 +288,9 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
   let lastMessageId = null;
   let keepFetching = true;
   let fetchCount = 0;
+  
+  // For batch database operations
+  let messageBatch = [];
   
   console.log(`Starting to fetch messages from channel: ${channel.name} (${channel.id})`);
   
@@ -364,6 +319,20 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
       if (messages.size === 0) {
         console.log(`No more messages in ${channel.name}`);
         keepFetching = false;
+        
+        // Flush any remaining messages in the batch
+        if (messageBatch.length > 0) {
+          try {
+            console.log(`Inserting final batch of ${messageBatch.length} messages into database`);
+            await monitor.storeMessagesInDbBatch(messageBatch);
+            exportState.messagesStoredInDb += messageBatch.length;
+            messageBatch = [];
+          } catch (dbError) {
+            console.error('Error inserting final message batch into database:', dbError);
+            exportState.dbErrors++;
+          }
+        }
+        
         continue;
       }
       
@@ -382,15 +351,37 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
       
       console.log(`Found ${nonBotMessages.length} non-bot messages in batch`);
       
-      // Extract and write each message immediately
+      // Process each non-bot message
       for (const message of nonBotMessages) {
-        const messageData = extractMessageMetadata(message);
-        // Add the channel ID to the message data
-        messageData.channelId = channel.id;
-        await writeMessageToFile(messageData, exportState);
+        // Add to database batch
+        messageBatch.push(message);
+        exportState.messagesInCurrentChannel++;
         
-        // Also store in database
-        await monitor.storeMessageInDb(message);
+        // If batch reaches the configured size, store in database
+        if (messageBatch.length >= DB_BATCH_SIZE) {
+          try {
+            console.log(`Inserting batch of ${messageBatch.length} messages into database`);
+            await monitor.storeMessagesInDbBatch(messageBatch);
+            exportState.messagesStoredInDb += messageBatch.length;
+            messageBatch = []; // Clear the batch after successful insert
+          } catch (dbError) {
+            console.error('Error inserting message batch into database:', dbError);
+            exportState.dbErrors++;
+            
+            // If batch insert fails, try inserting messages individually
+            console.log('Attempting to insert messages individually...');
+            for (const batchMessage of messageBatch) {
+              try {
+                await monitor.storeMessageInDb(batchMessage);
+                exportState.messagesStoredInDb++;
+              } catch (singleError) {
+                console.error(`Error inserting individual message ${batchMessage.id}:`, singleError);
+                exportState.dbErrors++;
+              }
+            }
+            messageBatch = []; // Clear the batch after attempting individual inserts
+          }
+        }
         
         // Update processed counter for status display
         exportState.processedMessages++;
@@ -407,6 +398,32 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
       if (messages.size < 100) {
         console.log(`Reached end of messages for ${channel.name}`);
         keepFetching = false;
+        
+        // Flush any remaining messages in the batch
+        if (messageBatch.length > 0) {
+          try {
+            console.log(`Inserting final batch of ${messageBatch.length} messages into database`);
+            await monitor.storeMessagesInDbBatch(messageBatch);
+            exportState.messagesStoredInDb += messageBatch.length;
+            messageBatch = [];
+          } catch (dbError) {
+            console.error('Error inserting final message batch into database:', dbError);
+            exportState.dbErrors++;
+            
+            // If batch insert fails, try inserting messages individually
+            console.log('Attempting to insert remaining messages individually...');
+            for (const batchMessage of messageBatch) {
+              try {
+                await monitor.storeMessageInDb(batchMessage);
+                exportState.messagesStoredInDb++;
+              } catch (singleError) {
+                console.error(`Error inserting individual message ${batchMessage.id}:`, singleError);
+                exportState.dbErrors++;
+              }
+            }
+            messageBatch = []; // Clear the batch after attempting individual inserts
+          }
+        }
       }
       
     } catch (error) {
@@ -424,6 +441,30 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
       } else {
         console.error(`Error fetching messages from ${channel.name}:`, error);
         keepFetching = false;
+        
+        // If there's an error and we still have messages in the batch, try to save them
+        if (messageBatch.length > 0) {
+          try {
+            console.log(`Attempting to insert ${messageBatch.length} messages into database after error`);
+            await monitor.storeMessagesInDbBatch(messageBatch);
+            exportState.messagesStoredInDb += messageBatch.length;
+          } catch (dbError) {
+            console.error('Error inserting message batch into database after fetch error:', dbError);
+            exportState.dbErrors++;
+            
+            // Try inserting individually
+            for (const batchMessage of messageBatch) {
+              try {
+                await monitor.storeMessageInDb(batchMessage);
+                exportState.messagesStoredInDb++;
+              } catch (singleError) {
+                console.error(`Error inserting individual message ${batchMessage.id}:`, singleError);
+                exportState.dbErrors++;
+              }
+            }
+          }
+          messageBatch = [];
+        }
       }
     }
   }
@@ -434,6 +475,7 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
   console.log(`Completed processing channel: ${channel.name} (${channel.id}), processed ${exportState.messagesInCurrentChannel} messages`);
 }
 
+// Extract message metadata - this function is still needed for monitor.js
 function extractMessageMetadata(message) {
   // Format with all relevant message data
   return {
@@ -504,26 +546,24 @@ async function updateStatusMessage(statusMessage, exportState, guild, isFinal = 
   // Calculate export number based on memory-triggered saves
   const exportNumber = exportState.memoryTriggeredSaves + 1;
   
-  // Build status message exactly matching your example format
-  let status = `Guild Export Status (#${exportNumber})\n`;
+  // Build status message
+  let status = `Guild Database Import Status (#${exportNumber})\n`;
   
   if (isFinal) {
-    status += `✅ Export completed! ${exportState.processedMessages.toLocaleString()} non-bot messages saved to ${exportState.filename}\n`;
-    status += `📝 Messages written to file: ${exportState.messagesWrittenToFile.toLocaleString()}\n`;
+    status += `✅ Import completed! ${exportState.processedMessages.toLocaleString()} non-bot messages saved to database\n`;
+    status += `📝 Messages stored in database: ${exportState.messagesStoredInDb.toLocaleString()}\n`;
     status += `🤖 Bot messages skipped: ${exportState.messageDroppedCount.toLocaleString()}\n`;
     
-    if (exportState.messageWriteErrors > 0) {
-      status += `⚠️ Write errors encountered: ${exportState.messageWriteErrors}\n`;
+    if (exportState.dbErrors > 0) {
+      status += `⚠️ Database errors encountered: ${exportState.dbErrors}\n`;
     }
     
-    // Add verification
-    status += `✓ Verification: ${exportState.processedMessages === exportState.messagesWrittenToFile ? 
-      'All messages successfully written' : 
-      'DISCREPANCY DETECTED - check logs'}\n`;
+    // Add database name
+    status += `💾 Database file: ${monitor.getCurrentDatabasePath()}\n`;
   } else if (exportState.currentChannel) {
     status += `🔄 Processing channel ${exportState.currentChannelIndex}/${exportState.totalChannels}: ${exportState.currentChannel.name}\n`;
   } else {
-    status += `🔄 Initializing export...\n`;
+    status += `🔄 Initializing database import...\n`;
   }
   
   status += `📊 Processed ${exportState.processedMessages.toLocaleString()} non-bot messages from ${guild.name}\n`;
@@ -548,7 +588,7 @@ async function updateStatusMessage(statusMessage, exportState, guild, isFinal = 
 async function handleExportGuild(message, client) {
   const guild = message.guild;
   
-  console.log(`Starting export for guild: ${guild.name} (${guild.id})`);
+  console.log(`Starting database import for guild: ${guild.name} (${guild.id})`);
   logMemoryUsage('Initial');
   
   // Verify the user has administrator permissions
@@ -558,26 +598,22 @@ async function handleExportGuild(message, client) {
   
   // Create status message
   const statusMessage = await message.channel.send(
-    `Guild Export Status (#1)\n` +
-    `🔄 Initializing NDJSON export...`
+    `Guild Database Import Status (#1)\n` +
+    `🔄 Initializing database import...`
   );
 
-  // Create a unique filename for this export
-  const timestamp = new Date().toISOString();
-  const sanitizedGuildName = guild.name.replace(/[^a-z0-9]/gi, '-').toLowerCase();
-  const filename = `${sanitizedGuildName}-${guild.id}-${timestamp.replace(/[:.]/g, '-')}.ndjson`;
-  const filepath = path.join(process.cwd(), filename);
-  
-  console.log(`Export file will be created at: ${filepath}`);
+  // Initialize database with this guild
+  await monitor.initializeDatabase(guild);
+  console.log(`Database initialized for guild ${guild.name} at ${monitor.getCurrentDatabasePath()}`);
   
   // Initialize export state
   const exportState = {
     startTime: Date.now(),
     processedMessages: 0,
     messagesTotalProcessed: 0,
-    messagesWrittenToFile: 0,
+    messagesStoredInDb: 0,
     messageDroppedCount: 0,
-    messageWriteErrors: 0,
+    dbErrors: 0,
     totalChannels: 0,
     processedChannels: 0,
     currentChannelIndex: 0,
@@ -589,25 +625,10 @@ async function handleExportGuild(message, client) {
     memoryCheckCount: 0,
     memoryTriggeredSaves: 0,
     runningTasksCount: 0,
-    filename: filename,
-    filepath: filepath,
     saveInProgress: false,
-    memoryLimit: MEMORY_LIMIT_BYTES
+    memoryLimit: MEMORY_LIMIT_BYTES,
+    dbBatchSize: DB_BATCH_SIZE
   };
-
-  // Create the file with a header metadata record
-  const initialMetadata = {
-    type: 'metadata',
-    id: guild.id,
-    name: guild.name,
-    exportStartedAt: timestamp,
-    exportFormat: 'ndjson',
-    botVersion: '1.0.0-ndjson'
-  };
-  
-  // Write initial metadata as the first line
-  fs.writeFileSync(filepath, JSON.stringify(initialMetadata) + '\n');
-  console.log(`Created initial export file: ${filename}`);
   
   // Update the status message initially
   await updateStatusMessage(statusMessage, exportState, guild);
@@ -624,74 +645,51 @@ async function handleExportGuild(message, client) {
     
     console.log(`Found ${allChannels.length} visible channels to process`);
     
-    // Write channel metadata to the file
+    // Store channel metadata in database
     for (const channelObj of allChannels) {
       const channel = channelObj.channel;
-      const channelMetadata = {
-        type: 'channel',
-        id: channel.id,
-        name: channel.name,
-        channelType: channel.type,
-        isThread: channelObj.isThread,
-        parentId: channelObj.parentId,
-        parentName: channelObj.parentName
-      };
-      
-      // Write channel metadata as a separate NDJSON line
-      fs.appendFileSync(filepath, JSON.stringify(channelMetadata) + '\n');
+      await monitor.markChannelFetchingStarted(channel.id, channel.name);
     }
     
     // Process channels in parallel with controlled concurrency
     await processChannelsInParallel(allChannels, exportState, statusMessage, guild);
     
-    // Verify export completeness
-    const lineCount = await verifyExportCompleteness(exportState);
-    console.log(`Export verification complete. File contains ${lineCount} lines.`);
-    
     // Check for duplicates in the database after export is complete
     const duplicates = await monitor.checkForDuplicates();
     console.log(`Database duplicate check complete. Found ${duplicates} duplicate message IDs.`);
     
-    // Write the final status update metadata
-    const finalMetadata = {
-      type: 'metadata',
-      id: guild.id,
-      name: guild.name,
-      exportCompletedAt: new Date().toISOString(),
-      totalMessagesProcessed: exportState.messagesTotalProcessed,
-      totalNonBotMessages: exportState.processedMessages,
-      messagesWrittenToFile: exportState.messagesWrittenToFile,
-      botMessagesFiltered: exportState.messageDroppedCount,
-      writeErrors: exportState.messageWriteErrors,
-      fileLineCount: lineCount,
-      exportDurationSeconds: Math.floor((Date.now() - exportState.startTime) / 1000),
-      channelsProcessed: exportState.totalChannels,
-      rateLimitHits: exportState.rateLimitHits
-    };
-    fs.appendFileSync(filepath, JSON.stringify(finalMetadata) + '\n');
+    // Store final metadata in the database
+    try {
+      await monitor.storeGuildMetadata('import_completed_at', new Date().toISOString());
+      await monitor.storeGuildMetadata('total_messages_processed', exportState.messagesTotalProcessed.toString());
+      await monitor.storeGuildMetadata('total_non_bot_messages', exportState.processedMessages.toString());
+      await monitor.storeGuildMetadata('messages_stored_in_db', exportState.messagesStoredInDb.toString());
+      await monitor.storeGuildMetadata('bot_messages_filtered', exportState.messageDroppedCount.toString());
+      await monitor.storeGuildMetadata('database_errors', exportState.dbErrors.toString());
+      await monitor.storeGuildMetadata('export_duration_seconds', Math.floor((Date.now() - exportState.startTime) / 1000).toString());
+      await monitor.storeGuildMetadata('channels_processed', exportState.totalChannels.toString());
+      await monitor.storeGuildMetadata('rate_limit_hits', exportState.rateLimitHits.toString());
+    } catch (metadataError) {
+      console.error('Error storing final metadata:', metadataError);
+    }
     
     // Final status update
     await updateStatusMessage(statusMessage, exportState, guild, true);
     
-    console.log(`Export completed successfully for guild: ${guild.name} (${guild.id})`);
+    console.log(`Database import completed successfully for guild: ${guild.name} (${guild.id})`);
     logMemoryUsage('Final');
   } catch (error) {
-    console.error('Error during export:', error);
+    console.error('Error during database import:', error);
     
     try {
-      // Add error metadata to the file
-      const errorMetadata = {
-        type: 'error',
-        timestamp: new Date().toISOString(),
-        error: error.message,
-        stage: 'export-process'
-      };
-      fs.appendFileSync(filepath, JSON.stringify(errorMetadata) + '\n');
+      // Store error information in metadata
+      await monitor.storeGuildMetadata('import_error', error.message);
+      await monitor.storeGuildMetadata('import_error_time', new Date().toISOString());
     } catch (e) {
       console.error('Error saving error metadata:', e);
     }
     
-    await statusMessage.edit(`Error occurred during export: ${error.message}`);
+    await statusMessage.edit(`Error occurred during database import: ${error.message}`);
   } finally {
     // Clear timer
     clearInterval(memoryCheckTimer);
@@ -700,5 +698,6 @@ async function handleExportGuild(message, client) {
 
 // Export functions
 module.exports = {
-  handleExportGuild
+  handleExportGuild,
+  extractMessageMetadata // Still needed for other modules
 };

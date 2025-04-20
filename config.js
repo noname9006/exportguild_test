@@ -37,6 +37,12 @@ const config = {
   // Message database timeout in milliseconds (1 hour)
   messageDbTimeout: 3600000,
   
+  // Database batch insert size - how many messages to insert at once during export
+  dbBatchSize: 100,
+  
+  // Monitor batch insert size - how many messages to insert at once during monitoring
+  monitorBatchSize: 10,
+  
   // Helper function to get environment variables or use defaults from this config
   getConfig: function(key, envName) {
     // If environment variable exists, use it, otherwise use config value
@@ -141,6 +147,12 @@ ${channelsStr}
   
   // Message database timeout in milliseconds (1 hour)
   messageDbTimeout: ${this.messageDbTimeout},
+  
+  // Database batch insert size - how many messages to insert at once during export
+  dbBatchSize: ${this.dbBatchSize},
+  
+  // Monitor batch insert size - how many messages to insert at once during monitoring
+  monitorBatchSize: ${this.monitorBatchSize},
   
   // Helper function to get environment variables or use defaults from this config
   getConfig: ${this.getConfig.toString()},

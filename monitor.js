@@ -205,6 +205,11 @@ function addMessageToCache(message) {
 async function processMessageCache() {
   const now = Date.now();
   const messageDbTimeout = config.getConfig('messageDbTimeout', 'MESSAGE_DB_TIMEOUT') || 3600000; // Default 1 hour
+  const monitorBatchSize = config.getConfig('monitorBatchSize', 'MONITOR_BATCH_SIZE') || 10; // Use dedicated monitor batch size
+  
+  // For batch database operations
+  let messageBatch = [];
+  let processedCount = 0;
   
   for (const [messageId, data] of messageCache.entries()) {
     // Check if cache timeout has passed
@@ -234,11 +239,34 @@ async function processMessageCache() {
           
           // Try to fetch the message
           try {
-            await channel.messages.fetch(messageId);
+            const fetchedMessage = await channel.messages.fetch(messageId);
             
-            // If the message exists, store it in the database
-            await storeMessageInDb(data.message);
-            console.log(`Verified and stored message ${messageId} in database`);
+            // If the message exists, add it to the batch
+            messageBatch.push(fetchedMessage);
+            processedCount++;
+            
+            // If we've reached the batch size, process the batch
+            if (messageBatch.length >= monitorBatchSize) {
+              try {
+                await storeMessagesInDbBatch(messageBatch);
+                console.log(`Stored batch of ${messageBatch.length} messages in database from cache processing`);
+                messageBatch = []; // Clear batch after successful insert
+              } catch (batchError) {
+                console.error('Error inserting message batch into database:', batchError);
+                
+                // If batch fails, try individual inserts
+                console.log('Falling back to individual message processing...');
+                for (const msg of messageBatch) {
+                  try {
+                    await storeMessageInDb(msg);
+                    console.log(`Stored individual message ${msg.id} in database`);
+                  } catch (singleError) {
+                    console.error(`Error storing individual message ${msg.id}:`, singleError);
+                  }
+                }
+                messageBatch = []; // Clear batch after individual processing
+              }
+            }
             
           } catch (msgError) {
             console.log(`Message ${messageId} no longer exists, removing from cache`);
@@ -256,6 +284,31 @@ async function processMessageCache() {
         messageCache.delete(messageId);
       }
     }
+  }
+  
+  // Process any remaining messages in the batch
+  if (messageBatch.length > 0) {
+    try {
+      await storeMessagesInDbBatch(messageBatch);
+      console.log(`Stored final batch of ${messageBatch.length} messages in database from cache processing`);
+    } catch (batchError) {
+      console.error('Error inserting final message batch into database:', batchError);
+      
+      // If batch fails, try individual inserts
+      console.log('Falling back to individual message processing for final batch...');
+      for (const msg of messageBatch) {
+        try {
+          await storeMessageInDb(msg);
+          console.log(`Stored individual message ${msg.id} in database`);
+        } catch (singleError) {
+          console.error(`Error storing individual message ${msg.id}:`, singleError);
+        }
+      }
+    }
+  }
+  
+  if (processedCount > 0) {
+    console.log(`Cache processing completed: ${processedCount} messages processed and stored in database`);
   }
   
   // Schedule next processing
@@ -323,6 +376,72 @@ async function storeMessageInDb(message) {
     ], function(err) {
       if (err) {
         console.error('Error storing message in database:', err);
+        reject(err);
+        return;
+      }
+      
+      resolve(this.changes);
+    });
+  });
+}
+
+// Store multiple messages in database as a batch
+async function storeMessagesInDbBatch(messages) {
+  return new Promise((resolve, reject) => {
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
+    if (!messages || messages.length === 0) {
+      resolve(0);
+      return;
+    }
+    
+    // Prepare batch data
+    const messageValues = [];
+    const placeholders = [];
+    
+    // For each message, add values and build placeholders
+    for (const message of messages) {
+      // Get message metadata
+      const messageData = extractMessageMetadata(message);
+      
+      // Convert objects to JSON strings
+      const attachmentsJson = JSON.stringify(messageData.attachments);
+      const embedsJson = JSON.stringify(messageData.embeds);
+      const reactionsJson = JSON.stringify(messageData.reactions);
+      
+      // Add values
+      messageValues.push(
+        messageData.id, 
+        messageData.content, 
+        messageData.authorId, 
+        messageData.authorUsername, 
+        messageData.authorBot ? 1 : 0, 
+        messageData.timestamp, 
+        messageData.createdAt, 
+        messageData.channelId,
+        attachmentsJson,
+        embedsJson,
+        reactionsJson
+      );
+      
+      // Add placeholder for this message
+      placeholders.push('(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    }
+    
+    // Build the SQL statement for batch insert
+    const sql = `
+      INSERT OR REPLACE INTO messages 
+      (id, content, authorId, authorUsername, authorBot, timestamp, createdAt, channelId, attachmentsJson, embedsJson, reactionsJson) 
+      VALUES ${placeholders.join(', ')}
+    `;
+    
+    // Execute batch insert
+    db.run(sql, messageValues, function(err) {
+      if (err) {
+        console.error('Error batch storing messages in database:', err);
         reject(err);
         return;
       }
@@ -483,6 +602,31 @@ function shouldMonitorChannel(channelId) {
   return false;
 }
 
+async function storeGuildMetadata(key, value) {
+  return new Promise((resolve, reject) => {
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
+    const sql = `
+      INSERT OR REPLACE INTO guild_metadata 
+      (key, value) 
+      VALUES (?, ?)
+    `;
+    
+    db.run(sql, [key, value], function(err) {
+      if (err) {
+        console.error(`Error storing guild metadata ${key}:`, err);
+        reject(err);
+        return;
+      }
+      
+      resolve(this.changes);
+    });
+  });
+}
+
 // Export functions
 module.exports = {
   checkDatabaseExists,
@@ -490,6 +634,8 @@ module.exports = {
   addMessageToCache,
   processMessageCache,
   storeMessageInDb,
+  storeMessagesInDbBatch,
+  storeGuildMetadata,
   markChannelFetchingStarted,
   markChannelFetchingCompleted,
   checkForDuplicates,
