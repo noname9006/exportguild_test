@@ -604,26 +604,25 @@ function shouldMonitorChannel(channelId) {
 
 async function storeGuildMetadata(key, value) {
   return new Promise((resolve, reject) => {
-    if (!db) {
-      reject(new Error("Database not initialized"));
-      return;
-    }
-    
-    const sql = `
-      INSERT OR REPLACE INTO guild_metadata 
-      (key, value) 
-      VALUES (?, ?)
-    `;
-    
-    db.run(sql, [key, value], function(err) {
-      if (err) {
-        console.error(`Error storing guild metadata ${key}:`, err);
-        reject(err);
-        return;
-      }
+    try {
+      // Use INSERT OR REPLACE instead of just INSERT to handle duplicate keys
+      const stmt = db.prepare('INSERT OR REPLACE INTO guild_metadata (key, value) VALUES (?, ?)');
       
-      resolve(this.changes);
-    });
+      stmt.run(key, value, function(err) {
+        if (err) {
+          console.error(`Error storing metadata ${key}:`, err);
+          reject(err);
+          return;
+        }
+        
+        console.log(`Stored guild metadata: ${key} = ${value}`);
+        stmt.finalize();
+        resolve();
+      });
+    } catch (error) {
+      console.error(`Error in storeGuildMetadata for ${key}:`, error);
+      reject(error);
+    }
   });
 }
 

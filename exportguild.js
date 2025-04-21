@@ -24,6 +24,9 @@ const MEMORY_SCALE_FACTOR = 0.85;
 // Memory check frequency in milliseconds
 const MEMORY_CHECK_INTERVAL = config.getConfig('memoryCheckInterval', 'MEMORY_CHECK_INTERVAL');
 
+// Status update interval in milliseconds
+const STATUS_UPDATE_INTERVAL = config.getConfig('statusUpdateInterval', 'STATUS_UPDATE_INTERVAL') || 5000;
+
 // Maximum concurrent API requests
 const MAX_CONCURRENT_REQUESTS = 10;
 
@@ -245,6 +248,9 @@ async function processChannelsInParallel(channels, exportState, statusMessage, g
     exportState.currentChannelIndex = channelIndex + 1;
     exportState.messagesInCurrentChannel = 0;
     
+    // Store the channel in the active channels list
+    exportState.activeChannels.set(channel.id, channel.name);
+    
     console.log(`Processing channel ${channelIndex + 1}/${channels.length}: ${channel.name} (${channel.id})`);
     
     try {
@@ -254,6 +260,8 @@ async function processChannelsInParallel(channels, exportState, statusMessage, g
     } finally {
       exportState.runningTasksCount--;
       exportState.processedChannels++;
+      // Remove channel from active channels list
+      exportState.activeChannels.delete(channel.id);
       // Always process next to ensure we continue even after errors
       processNext();
     }
@@ -292,6 +300,11 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
   // For batch database operations
   let messageBatch = [];
   
+  // For measuring batch fetch speed
+  let lastBatchStartTime = Date.now();
+  let lastBatchSize = 0;
+  let currentBatchSpeed = 0;
+  
   console.log(`Starting to fetch messages from channel: ${channel.name} (${channel.id})`);
   
   while (keepFetching) {
@@ -304,6 +317,9 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
         }
       }
       
+      // Start timing for this batch
+      lastBatchStartTime = Date.now();
+      
       // Fetch messages - use optimal batch size
       const options = { limit: 100 }; // Max allowed by Discord API
       if (lastMessageId) {
@@ -315,6 +331,16 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
       
       const messages = await channel.messages.fetch(options);
       console.log(`Fetched ${messages.size} messages from ${channel.name}`);
+      
+      // Calculate the speed for this batch
+      const batchEndTime = Date.now();
+      const batchDuration = (batchEndTime - lastBatchStartTime) / 1000;
+      if (batchDuration > 0 && messages.size > 0) {
+        currentBatchSpeed = (messages.size / batchDuration).toFixed(2);
+        lastBatchSize = messages.size;
+        // Store current batch speed for this channel
+        exportState.channelBatchSpeed.set(channel.id, currentBatchSpeed);
+      }
       
       if (messages.size === 0) {
         console.log(`No more messages in ${channel.name}`);
@@ -387,9 +413,9 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
         exportState.processedMessages++;
       }
       
-      // Update status less frequently to reduce overhead
+      // Update status based on configured interval
       const currentTime = Date.now();
-      if (currentTime - exportState.lastStatusUpdateTime > 1000) {
+      if (currentTime - exportState.lastStatusUpdateTime > STATUS_UPDATE_INTERVAL) {
         exportState.lastStatusUpdateTime = currentTime;
         updateStatusMessage(statusMessage, exportState, guild);
       }
@@ -517,11 +543,11 @@ async function updateStatusMessage(statusMessage, exportState, guild, isFinal = 
   // Skip updates that are too frequent unless final
   if (!isFinal && statusUpdateTimeout) return;
   
-  // Set update throttling
+  // Set update throttling (using configured interval)
   if (!isFinal) {
     statusUpdateTimeout = setTimeout(() => {
       statusUpdateTimeout = null;
-    }, 1000); // Update at most once per second
+    }, STATUS_UPDATE_INTERVAL);
   }
   
   // Get memory usage for status message
@@ -535,10 +561,20 @@ async function updateStatusMessage(statusMessage, exportState, guild, isFinal = 
   const minutes = Math.floor((elapsedTime % (1000 * 60 * 60)) / (1000 * 60));
   const seconds = Math.floor((elapsedTime % (1000 * 60)) / 1000);
   
-  // Calculate processing speed
-  const messagesPerSecond = elapsedTime > 0 ? 
+  // Calculate average processing speed
+  const avgMessagesPerSecond = elapsedTime > 0 ? 
     (exportState.processedMessages / (elapsedTime / 1000)).toFixed(2) : 
     "0.00";
+  
+  // Calculate current processing speed (average of all active channels)
+  let currentSpeed = "0.00";
+  if (exportState.channelBatchSpeed.size > 0) {
+    let speedSum = 0;
+    for (const speed of exportState.channelBatchSpeed.values()) {
+      speedSum += parseFloat(speed);
+    }
+    currentSpeed = (speedSum / exportState.channelBatchSpeed.size).toFixed(2);
+  }
   
   // Current date in the exact format from your example
   const nowFormatted = formatDateToUTC();
@@ -560,17 +596,18 @@ async function updateStatusMessage(statusMessage, exportState, guild, isFinal = 
     
     // Add database name
     status += `💾 Database file: ${monitor.getCurrentDatabasePath()}\n`;
-  } else if (exportState.currentChannel) {
-    status += `🔄 Processing channel ${exportState.currentChannelIndex}/${exportState.totalChannels}: ${exportState.currentChannel.name}\n`;
+  } else if (exportState.activeChannels.size > 0) {
+    // Get all active channel names
+    const channelNames = Array.from(exportState.activeChannels.values());
+    status += `🔄 Processing ${exportState.activeChannels.size} channel(s): ${channelNames.join(', ')}\n`;
   } else {
     status += `🔄 Initializing database import...\n`;
   }
   
   status += `📊 Processed ${exportState.processedMessages.toLocaleString()} non-bot messages from ${guild.name}\n`;
   status += `⏱️ Time elapsed: ${hours}h ${minutes}m ${seconds}s\n`;
-  status += `⚡ Processing speed: ${messagesPerSecond} messages/second (average)\n`;
-  
-  status += `📈 Progress: ${exportState.processedChannels}/${exportState.totalChannels} channels (${Math.round(exportState.processedChannels / exportState.totalChannels * 100)}%)\n`;
+  status += `⚡ Processing speed: ${currentSpeed} messages/second (${avgMessagesPerSecond} average)\n`;
+    status += `📈 Progress: ${exportState.processedChannels}/${exportState.totalChannels} channels (${Math.round(exportState.processedChannels / exportState.totalChannels * 100)}%)\n`;
   
   status += `🚦 Rate limit hits: ${exportState.rateLimitHits}\n`;
   // Add memory usage info
@@ -627,7 +664,9 @@ async function handleExportGuild(message, client) {
     runningTasksCount: 0,
     saveInProgress: false,
     memoryLimit: MEMORY_LIMIT_BYTES,
-    dbBatchSize: DB_BATCH_SIZE
+    dbBatchSize: DB_BATCH_SIZE,
+    activeChannels: new Map(), // Map to track active channels (id -> name)
+    channelBatchSpeed: new Map() // Map to track current batch speed for each channel
   };
   
   // Update the status message initially
@@ -637,6 +676,11 @@ async function handleExportGuild(message, client) {
   const memoryCheckTimer = setInterval(() => {
     checkAndHandleMemoryUsage(exportState, 'TIMER_CHECK');
   }, MEMORY_CHECK_INTERVAL);
+  
+  // Set up status update timer
+  const statusUpdateTimer = setInterval(async () => {
+    await updateStatusMessage(statusMessage, exportState, guild);
+  }, STATUS_UPDATE_INTERVAL);
   
   try {
     // Get all channels in the guild that are actually visible
@@ -691,8 +735,9 @@ async function handleExportGuild(message, client) {
     
     await statusMessage.edit(`Error occurred during database import: ${error.message}`);
   } finally {
-    // Clear timer
+    // Clear timers
     clearInterval(memoryCheckTimer);
+    clearInterval(statusUpdateTimer);
   }
 }
 

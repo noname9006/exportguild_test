@@ -22,14 +22,12 @@ const config = {
     '1142972007080808468'
   ],
   
-  // Export threshold - how many messages to process before auto-save
-  exportThreshold: 10000,
   
   // Memory limit in MB - default to 500MB
   memoryLimitMB: 500,
   
   // Memory check interval in milliseconds (20 seconds)
-  memoryCheckInterval: 20000,
+  memoryCheckInterval: 1200000,
   
   // Auto-save interval in milliseconds (90 seconds)
   autoSaveInterval: 90000,
@@ -38,10 +36,13 @@ const config = {
   messageDbTimeout: 3600000,
   
   // Database batch insert size - how many messages to insert at once during export
-  dbBatchSize: 100,
+  dbBatchSize: 1000,
   
   // Monitor batch insert size - how many messages to insert at once during monitoring
   monitorBatchSize: 10,
+  
+  // Status update interval in milliseconds 
+  statusUpdateInterval: 20000,
   
   // Helper function to get environment variables or use defaults from this config
   getConfig: function(key, envName) {
@@ -153,6 +154,9 @@ ${channelsStr}
   
   // Monitor batch insert size - how many messages to insert at once during monitoring
   monitorBatchSize: ${this.monitorBatchSize},
+  
+  // Status update interval in milliseconds (5 seconds)
+  statusUpdateInterval: ${this.statusUpdateInterval},
   
   // Helper function to get environment variables or use defaults from this config
   getConfig: ${this.getConfig.toString()},
