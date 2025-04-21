@@ -221,7 +221,8 @@ Promise.all(insertPromises)
     }).catch(err => {
       console.error('Error loading channel states:', err);
       resolve(true); // Still resolve even if loading channel states fails
-  });
+			});
+			 });
           }); 
         });
       });
