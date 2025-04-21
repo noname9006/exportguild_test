@@ -15,6 +15,7 @@ const processData = require('./processData');
 const config = require('./config');
 const channelList = require('./channelList'); // Import the channelList module
 const monitor = require('./monitor'); // Import the monitor module
+const vacuum = require('./vacuum');
 
 // Set up the Discord client with necessary intents to read messages
 const client = new Client({
@@ -375,6 +376,37 @@ client.on('messageCreate', async (message) => {
       activeOperations.delete(message.guildId);
     }
   }
+  
+  else if (command === '!vacuum') {
+  // Check if an operation is already running for this guild
+  if (activeOperations.has(message.guildId)) {
+    return message.reply('An operation is already running for this guild!');
+  }
+  
+  // Set guild as being processed
+  activeOperations.add(message.guildId);
+
+  try {
+    // Log the command execution with timestamp and user info
+    const timestamp = getFormattedDateTime();
+    console.log(`[${timestamp}] Command: !vacuum executed by ${message.author.tag} (${message.author.id}) in guild ${message.guild.name} (${message.guild.id})`);
+    
+    // Run the vacuum command
+    await vacuum.handleVacuumCommand(message, monitor);
+    
+    // Log successful completion
+    console.log(`[${getFormattedDateTime()}] Completed: !vacuum for ${message.guild.name} (${message.guild.id})`);
+  } catch (error) {
+    console.error(`[${getFormattedDateTime()}] Error: !vacuum command failed:`, error);
+    message.channel.send(`Error vacuuming database: ${error.message}`);
+  } finally {
+    // Remove guild from active operations when done (even if there was an error)
+    activeOperations.delete(message.guildId);
+  }
+  
+  return;
+}
+
 });
 
 // Login to Discord
