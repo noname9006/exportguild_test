@@ -538,6 +538,10 @@ function formatDateToUTC() {
 
 // Status update with proper formatting
 let statusUpdateTimeout = null;
+let lastStatusUpdate = {
+  time: 0,
+  processedMessages: 0
+};
 
 async function updateStatusMessage(statusMessage, exportState, guild, isFinal = false) {
   // Skip updates that are too frequent unless final
@@ -561,20 +565,27 @@ async function updateStatusMessage(statusMessage, exportState, guild, isFinal = 
   const minutes = Math.floor((elapsedTime % (1000 * 60 * 60)) / (1000 * 60));
   const seconds = Math.floor((elapsedTime % (1000 * 60)) / 1000);
   
-  // Calculate average processing speed
+  // Calculate average processing speed over the entire runtime
   const avgMessagesPerSecond = elapsedTime > 0 ? 
     (exportState.processedMessages / (elapsedTime / 1000)).toFixed(2) : 
     "0.00";
   
-  // Calculate current processing speed (average of all active channels)
+// Calculate current processing speed based on differences between status updates
   let currentSpeed = "0.00";
-  if (exportState.channelBatchSpeed.size > 0) {
-    let speedSum = 0;
-    for (const speed of exportState.channelBatchSpeed.values()) {
-      speedSum += parseFloat(speed);
+  if (lastStatusUpdate.time > 0) {
+    const timeDiff = (currentTime - lastStatusUpdate.time) / 1000; // Convert to seconds
+    const messageDiff = exportState.processedMessages - lastStatusUpdate.processedMessages;
+    
+    if (timeDiff > 0) {
+      currentSpeed = (messageDiff / timeDiff).toFixed(2);
     }
-    currentSpeed = (speedSum / exportState.channelBatchSpeed.size).toFixed(2);
   }
+  
+    // Update the last status values for next calculation
+  lastStatusUpdate = {
+    time: currentTime,
+    processedMessages: exportState.processedMessages
+  };
   
   // Current date in the exact format from your example
   const nowFormatted = formatDateToUTC();
@@ -606,7 +617,7 @@ async function updateStatusMessage(statusMessage, exportState, guild, isFinal = 
   
   status += `📊 Processed ${exportState.processedMessages.toLocaleString()} non-bot messages from ${guild.name}\n`;
   status += `⏱️ Time elapsed: ${hours}h ${minutes}m ${seconds}s\n`;
-  status += `⚡ Processing speed: ${currentSpeed} messages/second (${avgMessagesPerSecond} average)\n`;
+  status += `⚡ Processing speed: ${currentSpeed} msg/sec (${avgMessagesPerSecond} average)\n`;
     status += `📈 Progress: ${exportState.processedChannels}/${exportState.totalChannels} channels (${Math.round(exportState.processedChannels / exportState.totalChannels * 100)}%)\n`;
   
   status += `🚦 Rate limit hits: ${exportState.rateLimitHits}\n`;
