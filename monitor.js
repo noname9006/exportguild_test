@@ -105,11 +105,18 @@ function initializeDatabase(guild = null) {
       
       // If database already existed, we're done
       if (dbExists) {
-        console.log('Using existing database');
-        dbInitialized = true;
-        resolve(true);
-        return;
-      }
+  console.log('Using existing database');
+  dbInitialized = true;
+  
+  // Load previously fetched channels after database initialization
+  loadFetchedChannelsState().then(() => {
+    resolve(true);
+  }).catch(err => {
+    console.error('Error loading channel states:', err);
+    resolve(true); // Still resolve even if loading channel states fails
+  });
+  return;
+}
       
       // Create messages table
       db.run(`
@@ -189,20 +196,33 @@ function initializeDatabase(guild = null) {
               });
             });
             
-            // Wait for all inserts to complete
-            Promise.all(insertPromises)
-              .then(() => {
-                console.log('Guild metadata stored in database');
-                dbInitialized = true;
-                resolve(true);
-              })
-              .catch(err => {
-                console.error('Error storing guild metadata:', err);
-                // Still mark as initialized even if metadata failed
-                dbInitialized = true;
-                resolve(true);
-              });
-          });
+            /// Wait for all inserts to complete
+Promise.all(insertPromises)
+  .then(() => {
+    console.log('Guild metadata stored in database');
+    dbInitialized = true;
+    
+    // Load previously fetched channels after database initialization
+    loadFetchedChannelsState().then(() => {
+      resolve(true);
+    }).catch(err => {
+      console.error('Error loading channel states:', err);
+      resolve(true); // Still resolve even if loading channel states fails
+    });
+  })
+  .catch(err => {
+    console.error('Error storing guild metadata:', err);
+    // Still mark as initialized even if metadata failed
+    dbInitialized = true;
+    
+    // Load previously fetched channels even if metadata failed
+    loadFetchedChannelsState().then(() => {
+      resolve(true);
+    }).catch(err => {
+      console.error('Error loading channel states:', err);
+      resolve(true); // Still resolve even if loading channel states fails
+  });
+          }); 
         });
       });
     });
@@ -636,6 +656,36 @@ async function getFetchedChannels() {
   });
 }
 
+// Add this function to monitor.js
+async function loadFetchedChannelsState() {
+  try {
+    if (!db || !dbInitialized) {
+      console.log('Cannot load fetched channels: database not initialized');
+      return;
+    }
+
+    console.log('Loading previously fetched channels from database...');
+    
+    // Query the database for channels that have been fetched
+    const channels = await getFetchedChannels();
+    
+    // Populate the fetchingComplete set from the database
+    for (const channel of channels) {
+      if (channel.fetchCompleted === 1) {
+        console.log(`Adding previously fetched channel to monitoring: ${channel.name} (${channel.id})`);
+        fetchingComplete.add(channel.id);
+      } else if (channel.fetchStarted === 1 && channel.fetchCompleted === 0) {
+        console.log(`Adding in-progress channel to monitoring: ${channel.name} (${channel.id})`);
+        fetchingInProgress.add(channel.id);
+      }
+    }
+    
+    console.log(`Loaded ${fetchingComplete.size} completed channels and ${fetchingInProgress.size} in-progress channels for monitoring`);
+  } catch (error) {
+    console.error('Error loading fetched channels state:', error);
+  }
+}
+
 // Should monitor channel?
 function shouldMonitorChannel(channelId) {
   // Don't monitor excluded channels
@@ -694,6 +744,7 @@ module.exports = {
   markChannelFetchingCompleted,
   checkForDuplicates,
   getFetchedChannels,
+  loadFetchedChannelsState,
   shouldMonitorChannel,
   extractMessageMetadata,
   generateDbFilename,
