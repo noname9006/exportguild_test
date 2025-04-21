@@ -27,38 +27,68 @@ function generateDbFilename(guild) {
   // Sanitize guild name for filename usage
   const sanitizedGuildName = guild.name.replace(/[^a-z0-9]/gi, '-').toLowerCase();
   
-  // Get current date in YYYY-MM-DD HH-MM-SS format
+  // Get current date in YYYY-MM-DD_HH-MM-SS format
   const now = new Date();
   const dateStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`;
   const timeStr = `${String(now.getUTCHours()).padStart(2, '0')}-${String(now.getUTCMinutes()).padStart(2, '0')}-${String(now.getUTCSeconds()).padStart(2, '0')}`;
   
-  // Create filename in format: guild-name-guildId-YYYY-MM-DD-HH-MM-SS.db
-  return `${sanitizedGuildName}-${guild.id}-${dateStr}-${timeStr}.db`;
+  // Create filename in format: guildname_guild_id_date_time_created.db
+  return `${sanitizedGuildName}_${guild.id}_${dateStr}_${timeStr}.db`;
 }
 
 // Check if database exists on startup
 function checkDatabaseExists(guild = null) {
-  if (guild) {
-    // Create database name with guild info
-    currentDbPath = path.join(process.cwd(), generateDbFilename(guild));
-    return false; // Always create a new DB for each guild operation
-  } else {
+  if (!guild) {
     // Check for default database for backward compatibility
     const defaultPath = path.join(process.cwd(), 'exportguild.db');
     currentDbPath = defaultPath; // Set the default path
     return fs.existsSync(defaultPath);
+  } else {
+    // Look for guild-specific database files
+    const files = fs.readdirSync(process.cwd())
+      .filter(file => file.endsWith('.db') && file.includes(`_${guild.id}_`))
+      .map(file => ({
+        name: file,
+        path: path.join(process.cwd(), file),
+        mtime: fs.statSync(path.join(process.cwd(), file)).mtime
+      }))
+      .sort((a, b) => b.mtime - a.mtime); // Sort by modification time, newest first
+      
+    if (files.length === 0) {
+      // No database found for this guild
+      // Don't set currentDbPath yet since we don't have a file
+      return false;
+    }
+    
+    // Use the most recent database file
+    console.log(`Found ${files.length} database files for guild ${guild.name}, using most recent: ${files[0].name}`);
+    currentDbPath = files[0].path;
+    return true;
   }
 }
 
 // Initialize database
 function initializeDatabase(guild = null) {
   return new Promise((resolve, reject) => {
+    // We should always require a guild parameter now
+    if (!guild) {
+      reject(new Error('Guild parameter is required for database initialization'));
+      return;
+    }
+    
     // Determine database path based on guild info
     const dbExists = checkDatabaseExists(guild);
     
+    // If no database exists, create a new one with the proper naming format
+    if (!dbExists) {
+      currentDbPath = path.join(process.cwd(), generateDbFilename(guild));
+      console.log(`Creating new database at: ${currentDbPath}`);
+    }
+    
     // At this point currentDbPath should be set
     if (!currentDbPath) {
-      currentDbPath = path.join(process.cwd(), 'exportguild.db');
+      reject(new Error('Database path not set'));
+      return;
     }
     
     console.log(`Initializing database at: ${currentDbPath}`);
@@ -133,52 +163,45 @@ function initializeDatabase(guild = null) {
               return;
             }
             
-            // If guild is provided, store metadata
-            if (guild) {
-              // Store guild info in metadata
-              const timestamp = new Date().toISOString();
-              const metadataEntries = [
-                { key: 'guild_id', value: guild.id },
-                { key: 'guild_name', value: guild.name },
-                { key: 'creation_date', value: timestamp }
-              ];
-              
-              // Insert all metadata entries
-              const insertPromises = metadataEntries.map(entry => {
-                return new Promise((resolve, reject) => {
-                  db.run(
-                    'INSERT INTO guild_metadata (key, value) VALUES (?, ?)',
-                    [entry.key, entry.value],
-                    function(err) {
-                      if (err) {
-                        console.error(`Error storing metadata ${entry.key}:`, err);
-                        reject(err);
-                      } else {
-                        resolve();
-                      }
+            // Store guild info in metadata
+            const timestamp = new Date().toISOString();
+            const metadataEntries = [
+              { key: 'guild_id', value: guild.id },
+              { key: 'guild_name', value: guild.name },
+              { key: 'creation_date', value: timestamp }
+            ];
+            
+            // Insert all metadata entries
+            const insertPromises = metadataEntries.map(entry => {
+              return new Promise((resolve, reject) => {
+                db.run(
+                  'INSERT INTO guild_metadata (key, value) VALUES (?, ?)',
+                  [entry.key, entry.value],
+                  function(err) {
+                    if (err) {
+                      console.error(`Error storing metadata ${entry.key}:`, err);
+                      reject(err);
+                    } else {
+                      resolve();
                     }
-                  );
-                });
+                  }
+                );
               });
-              
-              // Wait for all inserts to complete
-              Promise.all(insertPromises)
-                .then(() => {
-                  console.log('Guild metadata stored in database');
-                  dbInitialized = true;
-                  resolve(true);
-                })
-                .catch(err => {
-                  console.error('Error storing guild metadata:', err);
-                  // Still mark as initialized even if metadata failed
-                  dbInitialized = true;
-                  resolve(true);
-                });
-            } else {
-              console.log('Database initialized successfully');
-              dbInitialized = true;
-              resolve(true);
-            }
+            });
+            
+            // Wait for all inserts to complete
+            Promise.all(insertPromises)
+              .then(() => {
+                console.log('Guild metadata stored in database');
+                dbInitialized = true;
+                resolve(true);
+              })
+              .catch(err => {
+                console.error('Error storing guild metadata:', err);
+                // Still mark as initialized even if metadata failed
+                dbInitialized = true;
+                resolve(true);
+              });
           });
         });
       });
@@ -203,6 +226,13 @@ function addMessageToCache(message) {
 
 // Process message cache periodically
 async function processMessageCache() {
+  // If database isn't initialized, don't process messages
+  if (!dbInitialized || !db) {
+    console.log('Database not initialized. Will retry message cache processing in 60 seconds.');
+    setTimeout(processMessageCache, 60000); // Check again in a minute
+    return;
+  }
+
   const now = Date.now();
   const messageDbTimeout = config.getConfig('messageDbTimeout', 'MESSAGE_DB_TIMEOUT') || 3600000; // Default 1 hour
   const monitorBatchSize = config.getConfig('monitorBatchSize', 'MONITOR_BATCH_SIZE') || 10; // Use dedicated monitor batch size
@@ -346,6 +376,11 @@ function extractMessageMetadata(message) {
 // Store message in database
 async function storeMessageInDb(message) {
   return new Promise((resolve, reject) => {
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
     // Get message metadata
     const messageData = extractMessageMetadata(message);
     
@@ -454,6 +489,11 @@ async function storeMessagesInDbBatch(messages) {
 // Mark channel as fetching started
 function markChannelFetchingStarted(channelId, channelName) {
   return new Promise((resolve, reject) => {
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
     fetchingInProgress.add(channelId);
     
     const sql = `
@@ -483,6 +523,11 @@ function markChannelFetchingStarted(channelId, channelName) {
 // Mark channel as fetching completed
 function markChannelFetchingCompleted(channelId, lastMessageId = null) {
   return new Promise((resolve, reject) => {
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
     fetchingInProgress.delete(channelId);
     fetchingComplete.add(channelId);
     
@@ -511,6 +556,11 @@ function markChannelFetchingCompleted(channelId, lastMessageId = null) {
 // Check for duplicate messages in the database
 function checkForDuplicates() {
   return new Promise((resolve, reject) => {
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
     const sql = `
       SELECT id, COUNT(*) as count
       FROM messages
@@ -604,6 +654,11 @@ function shouldMonitorChannel(channelId) {
 
 async function storeGuildMetadata(key, value) {
   return new Promise((resolve, reject) => {
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
     try {
       // Use INSERT OR REPLACE instead of just INSERT to handle duplicate keys
       const stmt = db.prepare('INSERT OR REPLACE INTO guild_metadata (key, value) VALUES (?, ?)');

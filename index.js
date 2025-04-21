@@ -1,4 +1,3 @@
-// index.js - Main bot entry point
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -34,16 +33,39 @@ const client = new Client({
 
 // Track active operations to prevent multiple operations in the same guild
 const activeOperations = new Set();
+// Track guilds that have databases initialized
+const initializedGuilds = new Set();
 
 client.once('ready', async () => {
   console.log(`Bot is ready! Logged in as ${client.user.tag}`);
   
   try {
-    // Just start the message cache processing, but don't initialize DB yet
+    // Start message cache processing regardless of database state
+    // (it will check internally if database is initialized)
     monitor.processMessageCache();
     console.log('Message cache processing started');
+    
+    // For each guild the bot is connected to, check if a database exists
+    for (const [guildId, guild] of client.guilds.cache) {
+      try {
+        // This will check if a database exists without creating one
+        const dbExists = monitor.checkDatabaseExists(guild);
+        if (dbExists) {
+          console.log(`Found existing database for guild ${guild.name} (${guild.id})`);
+          // Initialize database with existing file
+          await monitor.initializeDatabase(guild);
+          // Mark guild as initialized
+          initializedGuilds.add(guildId);
+          console.log(`Database initialized for guild ${guild.name} (${guild.id})`);
+        } else {
+          console.log(`No database found for guild ${guild.name} (${guild.id}). Will not monitor messages until !exportguild is used.`);
+        }
+      } catch (error) {
+        console.error(`Error checking database for guild ${guild.name} (${guild.id}):`, error);
+      }
+    }
   } catch (error) {
-    console.error('Error starting message cache processing:', error);
+    console.error('Error during startup:', error);
   }
 });
 
@@ -236,19 +258,24 @@ function getFormattedDateTime() {
 
 // Command handler
 client.on('messageCreate', async (message) => {
-  // First check if we should be monitoring this message's channel
-  const shouldMonitor = monitor.shouldMonitorChannel(message.channelId);
-  
-  // If this is a message to be monitored (not from a bot, in a channel we're monitoring)
-  if (shouldMonitor && !message.author.bot) {
-    console.log(`Monitoring message ${message.id} in channel ${message.channelId}`);
-    
-    // Add to message cache for later verification and storage
-    monitor.addMessageToCache(message);
-  }
-  
-  // Ignore messages from bots for commands
+  // Ignore messages from bots for both commands and monitoring
   if (message.author.bot) return;
+  
+  const guildId = message.guildId;
+  
+  // First check if this guild has an initialized database
+  if (initializedGuilds.has(guildId)) {
+    // Check if we should be monitoring this message's channel
+    const shouldMonitor = monitor.shouldMonitorChannel(message.channelId);
+    
+    // If this is a message to be monitored
+    if (shouldMonitor) {
+      console.log(`Monitoring message ${message.id} in channel ${message.channelId}`);
+      
+      // Add to message cache for later verification and storage
+      monitor.addMessageToCache(message);
+    }
+  }
 
   const args = message.content.trim().split(/\s+/);
   const command = args[0].toLowerCase();
@@ -308,16 +335,19 @@ client.on('messageCreate', async (message) => {
     try {
       const subCommand = args[1]?.toLowerCase();
       
-      // Initialize the database with this guild info to create a guild-specific DB file
-      try {
-        await monitor.initializeDatabase(message.guild);
-        console.log(`Database initialized for guild ${message.guild.name} (${message.guild.id})`);
-        console.log(`Using database: ${monitor.getCurrentDatabasePath()}`);
-      } catch (dbError) {
-        console.error('Error initializing database:', dbError);
-      }
-      
       if (!subCommand || subCommand === 'export') {
+        // Initialize the database with this guild info if not already initialized
+        if (!initializedGuilds.has(message.guildId)) {
+          try {
+            await monitor.initializeDatabase(message.guild);
+            initializedGuilds.add(message.guildId);
+            console.log(`Database initialized for guild ${message.guild.name} (${message.guild.id})`);
+            console.log(`Using database: ${monitor.getCurrentDatabasePath()}`);
+          } catch (dbError) {
+            console.error('Error initializing database:', dbError);
+          }
+        }
+        
         // Export guild data
         await exportGuild.handleExportGuild(message, client);
         

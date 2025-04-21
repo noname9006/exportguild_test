@@ -639,9 +639,9 @@ async function handleExportGuild(message, client) {
     `🔄 Initializing database import...`
   );
 
-  // Initialize database with this guild
-  await monitor.initializeDatabase(guild);
-  console.log(`Database initialized for guild ${guild.name} at ${monitor.getCurrentDatabasePath()}`);
+  // Note: The database should already be initialized in index.js before this function is called
+  // We don't need to initialize it again here
+  console.log(`Using database at ${monitor.getCurrentDatabasePath()}`);
   
   // Initialize export state
   const exportState = {
