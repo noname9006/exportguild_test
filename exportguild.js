@@ -28,7 +28,7 @@ const MEMORY_CHECK_INTERVAL = config.getConfig('memoryCheckInterval', 'MEMORY_CH
 const STATUS_UPDATE_INTERVAL = config.getConfig('statusUpdateInterval', 'STATUS_UPDATE_INTERVAL') || 5000;
 
 // Maximum concurrent API requests
-const MAX_CONCURRENT_REQUESTS = 10;
+const MAX_CONCURRENT_REQUESTS = 15;
 
 // Function to check current memory usage and return details
 function checkMemoryUsage() {

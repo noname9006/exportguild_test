@@ -50,7 +50,19 @@ const config = {
   statusUpdateInterval: 20000,
   
   // How often to check the WAL for aged entries (in milliseconds)
-  walCheckInterval: 60000,
+  walCheckInterval: 6100000,
+  
+   // Cron schedule for automatic vacuum operations (default: every day at 2 AM)
+  vacuumCronSchedule: "0 2 * * *",
+  
+  // Whether automatic vacuum is enabled
+  autoVacuumEnabled: true,
+  
+    // Channel where monitoring notifications will be sent (set to empty string to disable)
+  channelMonitorLogChannel: "", 
+  
+  // Whether automatic channel monitoring is enabled
+  channelMonitoringEnabled: true,
   
   // Helper function to get environment variables or use defaults from this config
   getConfig: function(key, envName) {

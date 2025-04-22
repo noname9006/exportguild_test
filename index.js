@@ -17,6 +17,9 @@ const channelList = require('./channelList');
 const monitor = require('./monitor');
 const vacuum = require('./vacuum');
 const walManager = require('./wal-manager');
+const autoVacuum = require('./vacuum-auto');
+const channelMonitor = require('./channel-monitor');
+
 
 // Set up the Discord client with necessary intents to read messages
 const client = new Client({
@@ -77,7 +80,20 @@ client.once('ready', async () => {
       } catch (error) {
         console.error(`Error checking database for guild ${guild.name} (${guild.id}):`, error);
       }
+    } // <-- This closing curly brace was missing
+	  
+    // Initialize auto-vacuum schedule
+    autoVacuum.initializeAutoVacuum(client, {
+      // You can add a log channel ID if you want vacuum notifications in a specific channel
+      // logChannelId: 'YOUR_LOG_CHANNEL_ID' 
+    });
+	
+	    // Initialize channel monitoring
+    if (config.getConfig('channelMonitoringEnabled', 'CHANNEL_MONITORING_ENABLED')) {
+      channelMonitor.initializeChannelMonitoring(client);
+      console.log('Channel monitoring initialized');
     }
+    
   } catch (error) {
     console.error('Error during startup:', error);
   }

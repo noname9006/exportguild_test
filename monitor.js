@@ -158,20 +158,22 @@ function initializeDatabase(guild = null) {
         
         // Create channels table to track which channels have been fetched
         db.run(`
-          CREATE TABLE IF NOT EXISTS channels (
-            id TEXT PRIMARY KEY,
-            name TEXT,
-            fetchStarted INTEGER DEFAULT 0,
-            fetchCompleted INTEGER DEFAULT 0,
-            lastMessageId TEXT,
-            lastFetchTimestamp INTEGER
-          )
-        `, (err) => {
-          if (err) {
-            console.error('Error creating channels table:', err);
-            reject(err);
-            return;
-          }
+  CREATE TABLE IF NOT EXISTS channels (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    fetchStarted INTEGER DEFAULT 0,
+    fetchCompleted INTEGER DEFAULT 0,
+    lastMessageId TEXT,
+    lastFetchTimestamp INTEGER,
+    deleted INTEGER DEFAULT 0,
+    deletedAt INTEGER
+  )
+`, (err) => {
+  if (err) {
+    console.error('Error creating channels table:', err);
+    reject(err);
+    return;
+  }
           
           // Add metadata table for guild information
           db.run(`
