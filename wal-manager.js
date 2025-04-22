@@ -2,6 +2,7 @@
 
 const config = require('./config');
 const sqlite3 = require('sqlite3').verbose();
+const { extractMessageMetadata } = require('./monitor');
 
 // Global variables
 let db = null;
@@ -18,7 +19,8 @@ async function initialize(discordClient, database) {
   db = database;
   client = discordClient;
   
-  // Create the WAL table if it doesn't exist
+  // Create the WAL table if it doesn't exist - using the same structure as the messages table
+  // plus the processed flag
   await new Promise((resolve, reject) => {
     db.run(`
       CREATE TABLE IF NOT EXISTS message_wal (
@@ -33,7 +35,8 @@ async function initialize(discordClient, database) {
           attachmentsJson TEXT,
           embedsJson TEXT,
           reactionsJson TEXT,
-		  sticker_items TEXT
+          sticker_items TEXT,
+          processed INTEGER DEFAULT 0
       )
     `, (err) => {
       if (err) {
@@ -86,51 +89,41 @@ async function addMessage(message) {
   }
   
   try {
-    // Extract relevant data from the message
-    const messageData = {
-      message_id: message.id,
-      channel_id: message.channelId,
-      guild_id: message.guildId,
-      content: message.content || '',
-      author_id: message.author?.id || '',
-      timestamp: message.createdTimestamp, // Using message's timestamp
-      username: message.author?.username || '',
-      global_name: message.author?.globalName || message.author?.username || '',
-      avatar: message.author?.displayAvatarURL() || '',
-      bot: message.author?.bot ? 1 : 0,
-      attachments: JSON.stringify(Array.from(message.attachments.values())),
-      embeds: JSON.stringify(message.embeds),
-      reactions: JSON.stringify(Array.from(message.reactions.cache.values())),
-      reference_message_id: message.reference?.messageId || null,
-      reference_channel_id: message.reference?.channelId || null,
-      thread_id: message.channel?.isThread() ? message.channel.id : null,
-      sticker_items: JSON.stringify(Array.from(message.stickers?.values() || [])),
-      processed: 0
-    };
-
-    // Insert into WAL table
+    // Use the same message extraction logic from monitor.js for consistency
+    const messageData = extractMessageMetadata(message);
+    
+    // Convert objects to JSON strings
+    const attachmentsJson = JSON.stringify(messageData.attachments);
+    const embedsJson = JSON.stringify(messageData.embeds);
+    const reactionsJson = JSON.stringify(messageData.reactions);
+    
+    // Insert into WAL table using consistent column names with the messages table
     await new Promise((resolve, reject) => {
       db.run(`
         INSERT OR IGNORE INTO message_wal (
-          message_id, channel_id, guild_id, content, author_id,
-          timestamp, username, global_name, avatar, bot,
-          attachments, embeds, reactions,
-          reference_message_id, reference_channel_id, thread_id, sticker_items, processed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, content, authorId, authorUsername, authorBot, 
+          timestamp, createdAt, channelId, 
+          attachmentsJson, embedsJson, reactionsJson, processed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
-        messageData.message_id, messageData.channel_id, messageData.guild_id,
-        messageData.content, messageData.author_id,
-        messageData.timestamp, messageData.username, messageData.global_name,
-        messageData.avatar, messageData.bot,
-        messageData.attachments, messageData.embeds, messageData.reactions,
-        messageData.reference_message_id, messageData.reference_channel_id,
-        messageData.thread_id, messageData.sticker_items, messageData.processed
+        messageData.id, 
+        messageData.content, 
+        messageData.authorId, 
+        messageData.authorUsername, 
+        messageData.authorBot ? 1 : 0, 
+        messageData.timestamp, 
+        messageData.createdAt, 
+        messageData.channelId,
+        attachmentsJson,
+        embedsJson,
+        reactionsJson,
+        0 // processed flag initially set to 0
       ], function(err) {
         if (err) {
           console.error('Error adding message to WAL:', err);
           reject(err);
         } else {
-          console.log(`Added message ${messageData.message_id} to WAL queue`);
+          console.log(`Added message ${messageData.id} to WAL queue`);
           resolve(this.lastID);
         }
       });
@@ -161,6 +154,11 @@ async function checkWalEntries() {
     // We'll process messages that are older than the timeout
     const ageThreshold = Date.now() - messageDbTimeout;
     
+    // Log current time for reference
+    const now = new Date();
+    const currentTime = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')} ${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
+    console.log(`WAL check at ${currentTime} (UTC), age threshold: ${new Date(ageThreshold).toISOString()}`);
+    
     // Get entries ready to be processed (using message timestamp)
     const entriesToProcess = await new Promise((resolve, reject) => {
       db.all(`SELECT * FROM message_wal WHERE timestamp <= ? AND processed = 0`, [ageThreshold], (err, rows) => {
@@ -185,7 +183,7 @@ async function checkWalEntries() {
       try {
         // Mark as being processed
         await new Promise((resolve, reject) => {
-          db.run(`UPDATE message_wal SET processed = 1 WHERE message_id = ?`, [entry.message_id], (err) => {
+          db.run(`UPDATE message_wal SET processed = 1 WHERE id = ?`, [entry.id], (err) => {
             if (err) reject(err);
             else resolve();
           });
@@ -193,17 +191,17 @@ async function checkWalEntries() {
         
         // Check if the message exists in the messages table
         const exists = await new Promise((resolve, reject) => {
-          db.get(`SELECT 1 FROM messages WHERE message_id = ?`, [entry.message_id], (err, row) => {
+          db.get(`SELECT 1 FROM messages WHERE id = ?`, [entry.id], (err, row) => {
             if (err) reject(err);
             else resolve(!!row);
           });
         });
         
         if (exists) {
-          console.log(`Message ${entry.message_id} already exists in database, skipping`);
+          console.log(`Message ${entry.id} already exists in database, skipping`);
           // Delete from WAL since it's already in the main table
           await new Promise((resolve, reject) => {
-            db.run(`DELETE FROM message_wal WHERE message_id = ?`, [entry.message_id], (err) => {
+            db.run(`DELETE FROM message_wal WHERE id = ?`, [entry.id], (err) => {
               if (err) reject(err);
               else resolve();
             });
@@ -215,25 +213,29 @@ async function checkWalEntries() {
         await new Promise((resolve, reject) => {
           db.run(`
             INSERT INTO messages (
-              message_id, channel_id, guild_id, content, author_id,
-              timestamp, username, global_name, avatar, bot,
-              attachments, embeds, reactions,
-              reference_message_id, reference_channel_id, thread_id, sticker_items
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              id, content, authorId, authorUsername, authorBot,
+              timestamp, createdAt, channelId,
+              attachmentsJson, embedsJson, reactionsJson, sticker_items
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `, [
-            entry.message_id, entry.channel_id, entry.guild_id,
-            entry.content, entry.author_id,
-            entry.timestamp, entry.username, entry.global_name,
-            entry.avatar, entry.bot,
-            entry.attachments, entry.embeds, entry.reactions,
-            entry.reference_message_id, entry.reference_channel_id,
-            entry.thread_id, entry.sticker_items
+            entry.id, 
+            entry.content, 
+            entry.authorId, 
+            entry.authorUsername, 
+            entry.authorBot,
+            entry.timestamp, 
+            entry.createdAt, 
+            entry.channelId,
+            entry.attachmentsJson, 
+            entry.embedsJson, 
+            entry.reactionsJson,
+            entry.sticker_items
           ], function(err) {
             if (err) {
-              console.error(`Error inserting message ${entry.message_id} from WAL to main table:`, err);
+              console.error(`Error inserting message ${entry.id} from WAL to main table:`, err);
               reject(err);
             } else {
-              console.log(`Successfully moved message ${entry.message_id} from WAL to main table`);
+              console.log(`Successfully moved message ${entry.id} from WAL to main table`);
               resolve(this.lastID);
             }
           });
@@ -241,18 +243,18 @@ async function checkWalEntries() {
         
         // Delete from WAL after successful insert
         await new Promise((resolve, reject) => {
-          db.run(`DELETE FROM message_wal WHERE message_id = ?`, [entry.message_id], (err) => {
+          db.run(`DELETE FROM message_wal WHERE id = ?`, [entry.id], (err) => {
             if (err) reject(err);
             else resolve();
           });
         });
         
       } catch (err) {
-        console.error(`Error processing WAL entry for message ${entry.message_id}:`, err);
+        console.error(`Error processing WAL entry for message ${entry.id}:`, err);
         
         // Reset processed flag so it can be retried
         await new Promise((resolve) => {
-          db.run(`UPDATE message_wal SET processed = 0 WHERE message_id = ?`, [entry.message_id], () => {
+          db.run(`UPDATE message_wal SET processed = 0 WHERE id = ?`, [entry.id], () => {
             resolve();
           });
         }).catch(() => {});

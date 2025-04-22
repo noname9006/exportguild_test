@@ -175,14 +175,25 @@ async function fetchVisibleChannels(guild) {
       parentId: null
     }));
   
+  // Sort channels by ID (numerically smaller first)
+  textChannels.sort((a, b) => {
+    // Convert IDs to BigInt for proper numeric comparison
+    const idA = BigInt(a.channel.id);
+    const idB = BigInt(b.channel.id);
+    return idA < idB ? -1 : idA > idB ? 1 : 0;
+  });
+  
   visibleChannels.push(...textChannels);
-  console.log(`Found ${textChannels.length} text channels to process`);
+  console.log(`Found ${textChannels.length} text channels to process (sorted by channel ID)`);
   
   // Get threads in batches to avoid rate limiting
   const threadChannels = [];
   for (const channelObj of textChannels) {
     const channel = channelObj.channel;
-    if (!channel.threads) continue;
+    if (!channel.threads) {
+      console.log(`Channel ${channel.name} (${channel.id}) doesn't have threads property, skipping thread processing`);
+      continue;
+    }
     
     console.log(`Fetching threads for channel: ${channel.name} (${channel.id})`);
     
@@ -209,15 +220,22 @@ async function fetchVisibleChannels(guild) {
       
       // Add visible threads
       for (const thread of [...activeThreads.threads.values(), ...archivedThreads.threads.values()]) {
-        if (!excludedChannels.has(thread.id) && 
-            thread.viewable && 
-            thread.permissionsFor(guild.members.me).has(PermissionFlagsBits.ReadMessageHistory)) {
-          threadChannels.push({
-            channel: thread,
-            isThread: true,
-            parentId: channel.id,
-            parentName: channel.name
-          });
+        try {
+          if (!excludedChannels.has(thread.id) && 
+              thread.viewable && 
+              thread.permissionsFor(guild.members.me).has(PermissionFlagsBits.ReadMessageHistory)) {
+            threadChannels.push({
+              channel: thread,
+              isThread: true,
+              parentId: channel.id,
+              parentName: channel.name
+            });
+            console.log(`Added thread: ${thread.name} (${thread.id}) from parent ${channel.name}`);
+          } else {
+            console.log(`Skipping thread ${thread.name} (${thread.id}) due to permissions or exclusion`);
+          }
+        } catch (threadError) {
+          console.error(`Error processing individual thread ${thread.id}:`, threadError);
         }
       }
     } catch (error) {
@@ -225,8 +243,30 @@ async function fetchVisibleChannels(guild) {
     }
   }
   
-  visibleChannels.push(...threadChannels);
-  console.log(`Found ${threadChannels.length} thread channels to process`);
+  console.log(`Found ${threadChannels.length} thread channels before sorting`);
+  
+  // Sort thread channels by ID as well if there are any
+  if (threadChannels.length > 0) {
+    threadChannels.sort((a, b) => {
+      // Use try-catch to handle any potential errors with ID parsing
+      try {
+        const idA = BigInt(a.channel.id);
+        const idB = BigInt(b.channel.id);
+        return idA < idB ? -1 : idA > idB ? 1 : 0;
+      } catch (err) {
+        console.error('Error sorting thread channels:', err);
+        return 0; // Keep original order if error
+      }
+    });
+    visibleChannels.push(...threadChannels);
+  }
+  
+  console.log(`Total of ${threadChannels.length} thread channels added to processing queue`);
+  
+  // Final summary
+  const regularCount = visibleChannels.filter(ch => !ch.isThread).length;
+  const threadCount = visibleChannels.filter(ch => ch.isThread).length;
+  console.log(`Processing queue contains ${regularCount} regular channels and ${threadCount} thread channels`);
   
   return visibleChannels;
 }
