@@ -23,7 +23,7 @@ const config = {
   ],
   
   // Export threshold - how many messages to process before auto-save
-  exportThreshold: 1000, // Added this line assuming a default of 1000
+  exportThreshold: 1000,
   
   // Memory limit in MB - default to 500MB
   memoryLimitMB: 500,
@@ -37,6 +37,9 @@ const config = {
   // Message database timeout in milliseconds (1 hour)
   messageDbTimeout: 3600000,
   
+  // WAL entry retention time in milliseconds (7 days)
+  walRetentionTime: 604800000,
+  
   // Database batch insert size - how many messages to insert at once during export
   dbBatchSize: 1000,
   
@@ -46,7 +49,7 @@ const config = {
   // Status update interval in milliseconds 
   statusUpdateInterval: 20000,
   
-  // How often to check the WAL for aged entries (in milliseconds) - NEW
+  // How often to check the WAL for aged entries (in milliseconds)
   walCheckInterval: 60000,
   
   // Helper function to get environment variables or use defaults from this config
@@ -154,13 +157,16 @@ ${channelsStr}
   // Message database timeout in milliseconds (1 hour)
   messageDbTimeout: ${this.messageDbTimeout},
   
+  // WAL entry retention time in milliseconds (7 days)
+  walRetentionTime: ${this.walRetentionTime},
+  
   // Database batch insert size - how many messages to insert at once during export
   dbBatchSize: ${this.dbBatchSize},
   
   // Monitor batch insert size - how many messages to insert at once during monitoring
   monitorBatchSize: ${this.monitorBatchSize},
   
-  // Status update interval in milliseconds (5 seconds)
+  // Status update interval in milliseconds
   statusUpdateInterval: ${this.statusUpdateInterval},
   
   // How often to check the WAL for aged entries (in milliseconds)

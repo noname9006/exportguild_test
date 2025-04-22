@@ -1,5 +1,4 @@
 // wal-manager.js - Write-Ahead Log manager for Discord messages
-
 const config = require('./config');
 const sqlite3 = require('sqlite3').verbose();
 const { extractMessageMetadata } = require('./monitor');
@@ -71,6 +70,11 @@ function startWalChecking() {
   walCheckInterval = setInterval(() => {
     checkWalEntries().catch(err => {
       console.error('Error checking WAL entries:', err);
+    });
+    
+    // Also clean up old WAL entries
+    cleanupOldWalEntries().catch(err => {
+      console.error('Error cleaning up old WAL entries:', err);
     });
   }, checkInterval);
   
@@ -181,7 +185,7 @@ async function checkWalEntries() {
     // Process each entry
     for (const entry of entriesToProcess) {
       try {
-        // Mark as being processed
+        // Mark as processed first, regardless of outcome
         await new Promise((resolve, reject) => {
           db.run(`UPDATE message_wal SET processed = 1 WHERE id = ?`, [entry.id], (err) => {
             if (err) reject(err);
@@ -189,65 +193,75 @@ async function checkWalEntries() {
           });
         });
         
-        // Check if the message exists in the messages table
-        const exists = await new Promise((resolve, reject) => {
+        // Check if the message already exists in the database
+        const existsInDb = await new Promise((resolve, reject) => {
           db.get(`SELECT 1 FROM messages WHERE id = ?`, [entry.id], (err, row) => {
             if (err) reject(err);
             else resolve(!!row);
           });
         });
         
-        if (exists) {
+        if (existsInDb) {
           console.log(`Message ${entry.id} already exists in database, skipping`);
-          // Delete from WAL since it's already in the main table
-          await new Promise((resolve, reject) => {
-            db.run(`DELETE FROM message_wal WHERE id = ?`, [entry.id], (err) => {
-              if (err) reject(err);
-              else resolve();
-            });
-          });
+          // We don't delete from WAL here - will be handled by cleanup logic
           continue;
         }
         
-        // Insert into messages table
-        await new Promise((resolve, reject) => {
-          db.run(`
-            INSERT INTO messages (
-              id, content, authorId, authorUsername, authorBot,
-              timestamp, createdAt, channelId,
-              attachmentsJson, embedsJson, reactionsJson, sticker_items
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `, [
-            entry.id, 
-            entry.content, 
-            entry.authorId, 
-            entry.authorUsername, 
-            entry.authorBot,
-            entry.timestamp, 
-            entry.createdAt, 
-            entry.channelId,
-            entry.attachmentsJson, 
-            entry.embedsJson, 
-            entry.reactionsJson,
-            entry.sticker_items
-          ], function(err) {
-            if (err) {
-              console.error(`Error inserting message ${entry.id} from WAL to main table:`, err);
-              reject(err);
-            } else {
-              console.log(`Successfully moved message ${entry.id} from WAL to main table`);
-              resolve(this.lastID);
-            }
-          });
-        });
+        // Try to verify that the message still exists on Discord
+        let messageExists = false;
+        try {
+          // Get the channel from Discord
+          const channel = await client.channels.fetch(entry.channelId);
+          if (channel) {
+            // Try to fetch the message
+            const message = await channel.messages.fetch(entry.id);
+            // If we get here, the message exists
+            messageExists = !!message;
+          }
+        } catch (discordErr) {
+          console.log(`Message ${entry.id} no longer exists on Discord: ${discordErr.message}`);
+          // Message doesn't exist (or we can't fetch it)
+          messageExists = false;
+        }
         
-        // Delete from WAL after successful insert
-        await new Promise((resolve, reject) => {
-          db.run(`DELETE FROM message_wal WHERE id = ?`, [entry.id], (err) => {
-            if (err) reject(err);
-            else resolve();
+        // Only insert into the messages table if the message still exists
+        if (messageExists) {
+          // Insert into messages table
+          await new Promise((resolve, reject) => {
+            db.run(`
+              INSERT INTO messages (
+                id, content, authorId, authorUsername, authorBot,
+                timestamp, createdAt, channelId,
+                attachmentsJson, embedsJson, reactionsJson, sticker_items
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [
+              entry.id, 
+              entry.content, 
+              entry.authorId, 
+              entry.authorUsername, 
+              entry.authorBot,
+              entry.timestamp, 
+              entry.createdAt, 
+              entry.channelId,
+              entry.attachmentsJson, 
+              entry.embedsJson, 
+              entry.reactionsJson,
+              entry.sticker_items
+            ], function(err) {
+              if (err) {
+                console.error(`Error inserting message ${entry.id} from WAL to main table:`, err);
+                reject(err);
+              } else {
+                console.log(`Successfully moved message ${entry.id} from WAL to main table`);
+                resolve(this.lastID);
+              }
+            });
           });
-        });
+        } else {
+          console.log(`Message ${entry.id} no longer exists, skipping database insertion`);
+        }
+        
+        // Note: We don't delete the WAL entry here - it will be cleaned up by the retention policy
         
       } catch (err) {
         console.error(`Error processing WAL entry for message ${entry.id}:`, err);
@@ -265,6 +279,58 @@ async function checkWalEntries() {
     
   } catch (error) {
     console.error('Error checking WAL entries:', error);
+    return false;
+  }
+}
+
+/**
+ * Clean up old WAL entries based on retention time
+ */
+async function cleanupOldWalEntries() {
+  // Return early if there's no database connection
+  if (!db) {
+    console.error('Cannot clean up WAL entries: No database connection');
+    return false;
+  }
+  
+  try {
+    // Get the retention time from config or use default (7 days)
+    const walRetentionTime = config.walRetentionTime || 604800000; // 7 days in ms
+    
+    // Calculate cutoff timestamp - use the message's original timestamp for retention
+    const cutoffTime = Date.now() - walRetentionTime;
+    
+    console.log(`Cleaning up WAL entries older than ${new Date(cutoffTime).toISOString()}`);
+    
+    // First, count how many entries will be deleted
+    const countToDelete = await new Promise((resolve, reject) => {
+      db.get(`SELECT COUNT(*) as count FROM message_wal WHERE timestamp < ?`, [cutoffTime], (err, row) => {
+        if (err) reject(err);
+        else resolve(row?.count || 0);
+      });
+    });
+    
+    if (countToDelete === 0) {
+      console.log('No old WAL entries to clean up');
+      return true;
+    }
+    
+    // Delete entries older than the retention period
+    await new Promise((resolve, reject) => {
+      db.run(`DELETE FROM message_wal WHERE timestamp < ?`, [cutoffTime], function(err) {
+        if (err) {
+          console.error('Error deleting old WAL entries:', err);
+          reject(err);
+        } else {
+          console.log(`Deleted ${this.changes} old WAL entries`);
+          resolve(this.changes);
+        }
+      });
+    });
+    
+    return true;
+  } catch (error) {
+    console.error('Error cleaning up old WAL entries:', error);
     return false;
   }
 }
@@ -315,6 +381,14 @@ async function getWalStats() {
       });
     });
     
+    // Get count of processed entries
+    const processedCount = await new Promise((resolve, reject) => {
+      db.get(`SELECT COUNT(*) as count FROM message_wal WHERE processed = 1`, (err, row) => {
+        if (err) reject(err);
+        else resolve(row?.count || 0);
+      });
+    });
+    
     // Calculate age statistics if we have entries
     let oldestAge = null;
     let newestAge = null;
@@ -330,12 +404,15 @@ async function getWalStats() {
     return {
       totalEntries: totalCount,
       readyToProcess: readyCount,
+      processedEntries: processedCount,
       oldestTimestamp: oldest ? new Date(oldest).toISOString() : null,
       newestTimestamp: newest ? new Date(newest).toISOString() : null,
       oldestAgeMs: oldestAge,
       newestAgeMs: newestAge,
       oldestAgeFormatted: oldestAge ? formatDuration(oldestAge) : null,
-      newestAgeFormatted: newestAge ? formatDuration(newestAge) : null
+      newestAgeFormatted: newestAge ? formatDuration(newestAge) : null,
+      retentionTimeMs: config.walRetentionTime || 604800000,
+      retentionTimeFormatted: formatDuration(config.walRetentionTime || 604800000)
     };
     
   } catch (error) {
@@ -383,6 +460,7 @@ module.exports = {
   initialize,
   addMessage,
   checkWalEntries,
+  cleanupOldWalEntries,
   getWalStats,
   shutdown
 };
