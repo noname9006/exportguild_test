@@ -42,10 +42,12 @@ client.once('ready', async () => {
   console.log(`Bot is ready! Logged in as ${client.user.tag}`);
   
   try {
-    // Start message cache processing regardless of database state
-    // (it will check internally if database is initialized)
-    monitor.processMessageCache();
-    console.log('Message cache processing started');
+    // Make sure monitoring is not started multiple times
+    if (!global.monitoringActive) {
+      global.monitoringActive = true;
+      monitor.processMessageCache();
+      console.log('Message cache processing started globally');
+    }
     
     // For each guild the bot is connected to, check if a database exists
     for (const [guildId, guild] of client.guilds.cache) {
@@ -65,12 +67,12 @@ client.once('ready', async () => {
             await walManager.initialize(client, db);
             // Mark guild as initialized
             initializedGuilds.add(guildId);
-            console.log(`Database initialized for guild ${guild.name} (${guild.id})`);
+            console.log(`Database initialized for guild ${guild.name} (${guild.id}), monitoring active`);
           } else {
             console.error(`Database not available for guild ${guild.name} after initialization`);
           }
         } else {
-          console.log(`No database found for guild ${guild.name} (${guild.id}). Will not monitor messages until !exportguild is used.`);
+          console.log(`No database found for guild ${guild.name} (${guild.id}). Will create one when !exportguild is used.`);
         }
       } catch (error) {
         console.error(`Error checking database for guild ${guild.name} (${guild.id}):`, error);

@@ -68,6 +68,7 @@ function checkDatabaseExists(guild = null) {
 }
 
 // Initialize database
+// Initialize database
 function initializeDatabase(guild = null) {
   return new Promise((resolve, reject) => {
     // We should always require a guild parameter now
@@ -105,18 +106,32 @@ function initializeDatabase(guild = null) {
       
       // If database already existed, we're done
       if (dbExists) {
-  console.log('Using existing database');
-  dbInitialized = true;
-  
-  // Load previously fetched channels after database initialization
-  loadFetchedChannelsState().then(() => {
-    resolve(true);
-  }).catch(err => {
-    console.error('Error loading channel states:', err);
-    resolve(true); // Still resolve even if loading channel states fails
-  });
-  return;
-}
+        console.log('Using existing database');
+        dbInitialized = true;
+        
+        // Load previously fetched channels after database initialization
+        loadFetchedChannelsState().then(() => {
+          // Start message monitoring if not already running
+          if (!global.monitoringActive) {
+            global.monitoringActive = true;
+            console.log(`Monitoring activated for existing database: ${currentDbPath}`);
+            processMessageCache();
+          } else {
+            console.log(`Monitoring already active, continuing with existing process`);
+          }
+          resolve(true);
+        }).catch(err => {
+          console.error('Error loading channel states:', err);
+          // Still try to activate monitoring even if loading states fails
+          if (!global.monitoringActive) {
+            global.monitoringActive = true;
+            console.log(`Monitoring activated despite channel state loading error`);
+            processMessageCache();
+          }
+          resolve(true); // Still resolve even if loading channel states fails
+        });
+        return;
+      }
       
       // Create messages table
       db.run(`
@@ -132,7 +147,7 @@ function initializeDatabase(guild = null) {
           attachmentsJson TEXT,
           embedsJson TEXT,
           reactionsJson TEXT,
-		  sticker_items TEXT
+          sticker_items TEXT
         )
       `, (err) => {
         if (err) {
@@ -197,34 +212,58 @@ function initializeDatabase(guild = null) {
               });
             });
             
-            /// Wait for all inserts to complete
-Promise.all(insertPromises)
-  .then(() => {
-    console.log('Guild metadata stored in database');
-    dbInitialized = true;
-    
-    // Load previously fetched channels after database initialization
-    loadFetchedChannelsState().then(() => {
-      resolve(true);
-    }).catch(err => {
-      console.error('Error loading channel states:', err);
-      resolve(true); // Still resolve even if loading channel states fails
-    });
-  })
-  .catch(err => {
-    console.error('Error storing guild metadata:', err);
-    // Still mark as initialized even if metadata failed
-    dbInitialized = true;
-    
-    // Load previously fetched channels even if metadata failed
-    loadFetchedChannelsState().then(() => {
-      resolve(true);
-    }).catch(err => {
-      console.error('Error loading channel states:', err);
-      resolve(true); // Still resolve even if loading channel states fails
-			});
-			 });
-          }); 
+            // Wait for all inserts to complete
+            Promise.all(insertPromises)
+              .then(() => {
+                console.log('Guild metadata stored in database');
+                dbInitialized = true;
+                
+                // Load previously fetched channels after database initialization
+                loadFetchedChannelsState().then(() => {
+                  // Start message monitoring for new database
+                  if (!global.monitoringActive) {
+                    global.monitoringActive = true;
+                    console.log(`Monitoring activated for new database: ${currentDbPath}`);
+                    processMessageCache();
+                  }
+                  resolve(true);
+                }).catch(err => {
+                  console.error('Error loading channel states:', err);
+                  // Still try to activate monitoring even if loading states fails
+                  if (!global.monitoringActive) {
+                    global.monitoringActive = true;
+                    console.log(`Monitoring activated for new database despite channel state error`);
+                    processMessageCache();
+                  }
+                  resolve(true); // Still resolve even if loading channel states fails
+                });
+              })
+              .catch(err => {
+                console.error('Error storing guild metadata:', err);
+                // Still mark as initialized even if metadata failed
+                dbInitialized = true;
+                
+                // Load previously fetched channels even if metadata failed
+                loadFetchedChannelsState().then(() => {
+                  // Start message monitoring even if metadata failed
+                  if (!global.monitoringActive) {
+                    global.monitoringActive = true;
+                    console.log(`Monitoring activated despite metadata error`);
+                    processMessageCache();
+                  }
+                  resolve(true);
+                }).catch(err => {
+                  console.error('Error loading channel states:', err);
+                  // Still try to activate monitoring as last resort
+                  if (!global.monitoringActive) {
+                    global.monitoringActive = true;
+                    console.log(`Monitoring activated as last resort despite errors`);
+                    processMessageCache();
+                  }
+                  resolve(true); // Still resolve even if loading channel states fails
+                });
+              });
+          });
         });
       });
     });
@@ -688,7 +727,6 @@ async function loadFetchedChannelsState() {
   }
 }
 
-// Should monitor channel?
 function shouldMonitorChannel(channelId) {
   // Don't monitor excluded channels
   if (config.excludedChannels.includes(channelId)) {
@@ -697,10 +735,15 @@ function shouldMonitorChannel(channelId) {
   
   // If we have a database, we can monitor if we've fetched or are in process of fetching
   if (dbInitialized) {
-    return fetchingInProgress.has(channelId) || fetchingComplete.has(channelId);
+    const shouldMonitor = fetchingInProgress.has(channelId) || fetchingComplete.has(channelId);
+    if (shouldMonitor) {
+      console.log(`Monitoring active for channel ${channelId}`);
+    }
+    return shouldMonitor;
   }
   
   // If no database, don't monitor (waiting for fetching to begin)
+  console.log(`Not monitoring channel ${channelId} - database not initialized`);
   return false;
 }
 

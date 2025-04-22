@@ -330,8 +330,8 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
     return;
   }
   
-  // Mark channel as fetching started in database
   await monitor.markChannelFetchingStarted(channel.id, channel.name);
+  console.log(`Marked channel ${channel.name} (${channel.id}) for monitoring`);
   
   let lastMessageId = null;
   let keepFetching = true;
@@ -536,9 +536,8 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
   }
   
   // Mark channel as fetching completed in database with last message ID
-  await monitor.markChannelFetchingCompleted(channel.id, lastMessageId);
-  
-  console.log(`Completed processing channel: ${channel.name} (${channel.id}), processed ${exportState.messagesInCurrentChannel} messages`);
+await monitor.markChannelFetchingCompleted(channel.id, lastMessageId);
+  console.log(`Completed monitoring setup for channel: ${channel.name} (${channel.id})`);
 }
 
 // Extract message metadata - this function is still needed for monitor.js
@@ -690,8 +689,27 @@ async function handleExportGuild(message, client) {
     `🔄 Initializing database import...`
   );
 
-  // Note: The database should already be initialized in index.js before this function is called
-  // We don't need to initialize it again here
+  // Check if database needs initialization without relying on initializedGuilds
+  try {
+    // Check if database is already initialized by getting the database instance
+    const currentDb = monitor.getDatabase();
+    if (!currentDb) {
+      console.log(`Database not yet initialized for guild ${guild.name}, initializing now`);
+      await monitor.initializeDatabase(guild);
+      
+      // Get the database from monitor and initialize WAL manager
+      const db = monitor.getDatabase();
+      if (db) {
+        await walManager.initialize(client, db);
+      }
+      
+      console.log(`Database initialized for guild ${guild.name} (${guild.id})`);
+      console.log(`Using database: ${monitor.getCurrentDatabasePath()}`);
+    }
+  } catch (dbError) {
+    console.error('Error initializing database:', dbError);
+  }
+  
   console.log(`Using database at ${monitor.getCurrentDatabasePath()}`);
   
   // Initialize export state
@@ -771,6 +789,26 @@ async function handleExportGuild(message, client) {
     // Final status update
     await updateStatusMessage(statusMessage, exportState, guild, true);
     
+    // IMPORTANT: Ensure monitoring is active after export completes
+    console.log(`Export completed. Ensuring monitoring is active for guild ${guild.name}`);
+    
+    // Reload channel states to ensure monitoring picks up newly fetched channels
+    try {
+      await monitor.loadFetchedChannelsState();
+      console.log(`Reloaded fetched channel states after export for monitoring`);
+    } catch (channelStateError) {
+      console.error('Error reloading channel states after export:', channelStateError);
+    }
+    
+    // Make sure monitoring is running
+    if (!global.monitoringActive) {
+      global.monitoringActive = true;
+      monitor.processMessageCache();
+      console.log(`Started monitoring process after export completion`);
+    } else {
+      console.log(`Monitoring already active, continuing with existing process`);
+    }
+    
     console.log(`Database import completed successfully for guild: ${guild.name} (${guild.id})`);
     logMemoryUsage('Final');
   } catch (error) {
@@ -785,6 +823,17 @@ async function handleExportGuild(message, client) {
     }
     
     await statusMessage.edit(`Error occurred during database import: ${error.message}`);
+    
+    // Even after error, try to ensure monitoring is active
+    try {
+      if (!global.monitoringActive) {
+        global.monitoringActive = true;
+        monitor.processMessageCache();
+        console.log(`Started monitoring process despite export error`);
+      }
+    } catch (monitorError) {
+      console.error('Failed to start monitoring after export error:', monitorError);
+    }
   } finally {
     // Clear timers
     clearInterval(memoryCheckTimer);
