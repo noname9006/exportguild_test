@@ -22,6 +22,8 @@ const config = {
     '1142972007080808468'
   ],
   
+  // Export threshold - how many messages to process before auto-save
+  exportThreshold: 1000, // Added this line assuming a default of 1000
   
   // Memory limit in MB - default to 500MB
   memoryLimitMB: 500,
@@ -39,10 +41,13 @@ const config = {
   dbBatchSize: 1000,
   
   // Monitor batch insert size - how many messages to insert at once during monitoring
-  monitorBatchSize: 10,
+  monitorBatchSize: 5,
   
   // Status update interval in milliseconds 
   statusUpdateInterval: 20000,
+  
+  // How often to check the WAL for aged entries (in milliseconds) - NEW
+  walCheckInterval: 60000,
   
   // Helper function to get environment variables or use defaults from this config
   getConfig: function(key, envName) {
@@ -157,6 +162,9 @@ ${channelsStr}
   
   // Status update interval in milliseconds (5 seconds)
   statusUpdateInterval: ${this.statusUpdateInterval},
+  
+  // How often to check the WAL for aged entries (in milliseconds)
+  walCheckInterval: ${this.walCheckInterval},
   
   // Helper function to get environment variables or use defaults from this config
   getConfig: ${this.getConfig.toString()},

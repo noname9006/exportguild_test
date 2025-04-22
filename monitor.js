@@ -131,7 +131,8 @@ function initializeDatabase(guild = null) {
           channelId TEXT,
           attachmentsJson TEXT,
           embedsJson TEXT,
-          reactionsJson TEXT
+          reactionsJson TEXT,
+		  sticker_items TEXT
         )
       `, (err) => {
         if (err) {
@@ -732,6 +733,10 @@ async function storeGuildMetadata(key, value) {
   });
 }
 
+function getDatabase() {
+  return db; // Return the database connection object
+}
+
 // Export functions
 module.exports = {
   checkDatabaseExists,
@@ -749,5 +754,6 @@ module.exports = {
   shouldMonitorChannel,
   extractMessageMetadata,
   generateDbFilename,
-  getCurrentDatabasePath
+  getCurrentDatabasePath,
+  getDatabase
 };

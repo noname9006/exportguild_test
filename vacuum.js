@@ -1,34 +1,18 @@
-// vacuum.js - Database vacuuming functionality for admin users
 const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 const { PermissionFlagsBits } = require('discord.js');
 
-/**
- * Get the size of a file in MB
- * @param {string} filePath - Path to the file
- * @returns {number} - Size in MB
- */
 function getFileSize(filePath) {
   const stats = fs.statSync(filePath);
   const fileSizeInBytes = stats.size;
   return fileSizeInBytes / (1024 * 1024); // Convert to MB
 }
 
-/**
- * Format a number with commas as thousands separators
- * @param {number} num - Number to format
- * @returns {string} - Formatted number
- */
 function formatNumber(num) {
   return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
-/**
- * Vacuum the SQLite database
- * @param {string} dbPath - Path to the database file
- * @returns {Promise<Object>} - Object containing before and after sizes
- */
 async function vacuumDatabase(dbPath) {
   return new Promise((resolve, reject) => {
     // Get size before vacuum
@@ -78,12 +62,6 @@ async function vacuumDatabase(dbPath) {
   });
 }
 
-/**
- * Handle the database vacuum command
- * @param {Message} message - The Discord message that triggered the command
- * @param {Object} monitor - The monitor module with database path access
- * @returns {Promise<void>}
- */
 async function handleVacuumCommand(message, monitor) {
   try {
     // Check if user has administrator permissions

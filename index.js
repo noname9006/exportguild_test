@@ -13,9 +13,10 @@ const {
 const exportGuild = require('./exportguild');
 const processData = require('./processData');
 const config = require('./config');
-const channelList = require('./channelList'); // Import the channelList module
-const monitor = require('./monitor'); // Import the monitor module
+const channelList = require('./channelList');
+const monitor = require('./monitor');
 const vacuum = require('./vacuum');
+const walManager = require('./wal-manager');
 
 // Set up the Discord client with necessary intents to read messages
 const client = new Client({
@@ -55,9 +56,19 @@ client.once('ready', async () => {
           console.log(`Found existing database for guild ${guild.name} (${guild.id})`);
           // Initialize database with existing file
           await monitor.initializeDatabase(guild);
-          // Mark guild as initialized
-          initializedGuilds.add(guildId);
-          console.log(`Database initialized for guild ${guild.name} (${guild.id})`);
+          
+          // Get the database instance from monitor instead of using global db
+          const db = monitor.getDatabase();
+          
+          // Initialize WAL manager with the database from monitor
+          if (db) {
+            await walManager.initialize(client, db);
+            // Mark guild as initialized
+            initializedGuilds.add(guildId);
+            console.log(`Database initialized for guild ${guild.name} (${guild.id})`);
+          } else {
+            console.error(`Database not available for guild ${guild.name} after initialization`);
+          }
         } else {
           console.log(`No database found for guild ${guild.name} (${guild.id}). Will not monitor messages until !exportguild is used.`);
         }
@@ -273,8 +284,12 @@ client.on('messageCreate', async (message) => {
     if (shouldMonitor) {
       console.log(`Monitoring message ${message.id} in channel ${message.channelId}`);
       
-      // Add to message cache for later verification and storage
-      monitor.addMessageToCache(message);
+      // Add message to WAL manager
+      try {
+        await walManager.addMessage(message);
+      } catch (error) {
+        console.error(`Error adding message ${message.id} to WAL:`, error);
+      }
     }
   }
 
@@ -341,6 +356,13 @@ client.on('messageCreate', async (message) => {
         if (!initializedGuilds.has(message.guildId)) {
           try {
             await monitor.initializeDatabase(message.guild);
+            
+            // Get the database from monitor and initialize WAL manager
+            const db = monitor.getDatabase();
+            if (db) {
+              await walManager.initialize(client, db);
+            }
+            
             initializedGuilds.add(message.guildId);
             console.log(`Database initialized for guild ${message.guild.name} (${message.guild.id})`);
             console.log(`Using database: ${monitor.getCurrentDatabasePath()}`);
@@ -378,35 +400,34 @@ client.on('messageCreate', async (message) => {
   }
   
   else if (command === '!vacuum') {
-  // Check if an operation is already running for this guild
-  if (activeOperations.has(message.guildId)) {
-    return message.reply('An operation is already running for this guild!');
-  }
-  
-  // Set guild as being processed
-  activeOperations.add(message.guildId);
-
-  try {
-    // Log the command execution with timestamp and user info
-    const timestamp = getFormattedDateTime();
-    console.log(`[${timestamp}] Command: !vacuum executed by ${message.author.tag} (${message.author.id}) in guild ${message.guild.name} (${message.guild.id})`);
+    // Check if an operation is already running for this guild
+    if (activeOperations.has(message.guildId)) {
+      return message.reply('An operation is already running for this guild!');
+    }
     
-    // Run the vacuum command
-    await vacuum.handleVacuumCommand(message, monitor);
-    
-    // Log successful completion
-    console.log(`[${getFormattedDateTime()}] Completed: !vacuum for ${message.guild.name} (${message.guild.id})`);
-  } catch (error) {
-    console.error(`[${getFormattedDateTime()}] Error: !vacuum command failed:`, error);
-    message.channel.send(`Error vacuuming database: ${error.message}`);
-  } finally {
-    // Remove guild from active operations when done (even if there was an error)
-    activeOperations.delete(message.guildId);
-  }
-  
-  return;
-}
+    // Set guild as being processed
+    activeOperations.add(message.guildId);
 
+    try {
+      // Log the command execution with timestamp and user info
+      const timestamp = getFormattedDateTime();
+      console.log(`[${timestamp}] Command: !vacuum executed by ${message.author.tag} (${message.author.id}) in guild ${message.guild.name} (${message.guild.id})`);
+      
+      // Run the vacuum command
+      await vacuum.handleVacuumCommand(message, monitor);
+      
+      // Log successful completion
+      console.log(`[${getFormattedDateTime()}] Completed: !vacuum for ${message.guild.name} (${message.guild.id})`);
+    } catch (error) {
+      console.error(`[${getFormattedDateTime()}] Error: !vacuum command failed:`, error);
+      message.channel.send(`Error vacuuming database: ${error.message}`);
+    } finally {
+      // Remove guild from active operations when done (even if there was an error)
+      activeOperations.delete(message.guildId);
+    }
+    
+    return;
+  }
 });
 
 // Login to Discord
