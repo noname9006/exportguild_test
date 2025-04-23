@@ -6,6 +6,7 @@ const {
 } = require('discord.js');
 const config = require('./config');
 const monitor = require('./monitor');
+const memberTracker = require('./member-tracker');
 
 // Parse excluded channels from environment variable or config
 const excludedChannelsArray = config.getConfig('excludedChannels', 'EX_CHANNELS');
@@ -788,6 +789,33 @@ async function handleExportGuild(message, client) {
     
     // Final status update
     await updateStatusMessage(statusMessage, exportState, guild, true);
+	
+	// Fetch and store member data
+try {
+  console.log('Starting member data export...');
+  
+  const memberStatusMessage = await message.channel.send(
+    `Member Database Import Status\n` +
+    `🔄 Initializing member data import...`
+  );
+  
+  const memberResult = await memberTracker.fetchAndStoreMembersForGuild(guild, memberStatusMessage);
+  
+  if (memberResult.success) {
+    console.log(`Successfully stored member data: ${memberResult.memberCount} members with ${memberResult.roleCount} roles`);
+    
+    // Store metadata about member export
+    await monitor.storeGuildMetadata('members_exported', memberResult.memberCount.toString());
+    await monitor.storeGuildMetadata('member_roles_exported', memberResult.roleCount.toString());
+    await monitor.storeGuildMetadata('member_export_completed_at', new Date().toISOString());
+  } else {
+    console.error('Error during member export:', memberResult.error);
+    await monitor.storeGuildMetadata('member_export_error', memberResult.error);
+  }
+} catch (memberError) {
+  console.error('Error during member data export:', memberError);
+  await monitor.storeGuildMetadata('member_export_error', memberError.message);
+}
     
     // IMPORTANT: Ensure monitoring is active after export completes
     console.log(`Export completed. Ensuring monitoring is active for guild ${guild.name}`);

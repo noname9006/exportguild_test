@@ -19,6 +19,7 @@ const vacuum = require('./vacuum');
 const walManager = require('./wal-manager');
 const autoVacuum = require('./vacuum-auto');
 const channelMonitor = require('./channel-monitor');
+const memberTracker = require('./member-tracker');
 
 
 // Set up the Discord client with necessary intents to read messages
@@ -68,6 +69,10 @@ client.once('ready', async () => {
           // Initialize WAL manager with the database from monitor
           if (db) {
             await walManager.initialize(client, db);
+            
+            // Initialize member tracking tables in the database
+            await memberTracker.initializeMemberDatabase(db);
+            
             // Mark guild as initialized
             initializedGuilds.add(guildId);
             console.log(`Database initialized for guild ${guild.name} (${guild.id}), monitoring active`);
@@ -80,7 +85,7 @@ client.once('ready', async () => {
       } catch (error) {
         console.error(`Error checking database for guild ${guild.name} (${guild.id}):`, error);
       }
-    } // <-- This closing curly brace was missing
+    }
 	  
     // Initialize auto-vacuum schedule
     autoVacuum.initializeAutoVacuum(client, {
@@ -88,10 +93,16 @@ client.once('ready', async () => {
       // logChannelId: 'YOUR_LOG_CHANNEL_ID' 
     });
 	
-	    // Initialize channel monitoring
+    // Initialize channel monitoring
     if (config.getConfig('channelMonitoringEnabled', 'CHANNEL_MONITORING_ENABLED')) {
       channelMonitor.initializeChannelMonitoring(client);
       console.log('Channel monitoring initialized');
+    }
+    
+    // Initialize member monitoring
+    if (config.getConfig('memberTrackingEnabled', 'MEMBER_TRACKING_ENABLED')) {
+      memberTracker.initializeMemberTracking(client);
+      console.log('Member tracking initialized');
     }
     
   } catch (error) {
@@ -379,6 +390,9 @@ client.on('messageCreate', async (message) => {
             const db = monitor.getDatabase();
             if (db) {
               await walManager.initialize(client, db);
+              
+              // Initialize member tracking tables in the database
+              await memberTracker.initializeMemberDatabase(db);
             }
             
             initializedGuilds.add(message.guildId);
@@ -445,6 +459,125 @@ client.on('messageCreate', async (message) => {
     }
     
     return;
+  }
+  
+  else if (command === '!memberstats') {
+    // Check if user has administrator permissions
+    if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return message.reply('You need administrator permissions to use this command.');
+    }
+    
+    // Check if an operation is already running for this guild
+    if (activeOperations.has(message.guildId)) {
+      return message.reply('An operation is already running for this guild!');
+    }
+    
+    // Set guild as being processed
+    activeOperations.add(message.guildId);
+    
+    // Log the command execution with timestamp and user info
+    const timestamp = getFormattedDateTime();
+    console.log(`[${timestamp}] Command: !memberstats executed by ${message.author.tag} (${message.author.id}) in guild ${message.guild.name} (${message.guild.id})`);
+    
+    try {
+      const statusMessage = await message.channel.send('Generating member statistics...');
+      
+      // Get the database
+      const db = monitor.getDatabase();
+      if (!db) {
+        throw new Error('No database available. Please run !exportguild first to set up the database.');
+      }
+      
+      // Run the queries
+      db.all(`SELECT COUNT(*) as totalMembers FROM guild_members WHERE leftGuild = 0`, [], async (err, totalResult) => {
+        if (err) throw err;
+        
+        db.all(`SELECT COUNT(*) as botCount FROM guild_members WHERE bot = 1 AND leftGuild = 0`, [], async (err, botResult) => {
+          if (err) throw err;
+          
+          db.all(`SELECT roleName, COUNT(memberId) as memberCount FROM member_roles GROUP BY roleId ORDER BY memberCount DESC LIMIT 10`, [], async (err, roleResult) => {
+            if (err) throw err;
+            
+            db.all(`SELECT username, displayName, COUNT(roleId) as roleCount FROM guild_members 
+                    JOIN member_roles ON guild_members.id = member_roles.memberId 
+                    WHERE leftGuild = 0 
+                    GROUP BY memberId ORDER BY roleCount DESC LIMIT 10`, [], async (err, memberResult) => {
+              if (err) throw err;
+              
+              // Format the response
+              const totalMembers = totalResult[0].totalMembers;
+              const botCount = botResult[0].botCount;
+              const humanCount = totalMembers - botCount;
+              
+              let response = `# Member Statistics for ${message.guild.name}\n\n`;
+              response += `**Total Members:** ${totalMembers}\n`;
+              response += `**Human Members:** ${humanCount}\n`;
+              response += `**Bot Members:** ${botCount}\n\n`;
+              
+              response += `## Top 10 Roles by Member Count\n`;
+              if (roleResult.length === 0) {
+                response += "*No role data available*\n";
+              } else {
+                roleResult.forEach(role => {
+                  response += `- **${role.roleName}**: ${role.memberCount} members\n`;
+                });
+              }
+              
+              response += `\n## Top 10 Members by Role Count\n`;
+              if (memberResult.length === 0) {
+                response += "*No member role data available*\n";
+              } else {
+                memberResult.forEach(member => {
+                  response += `- **${member.displayName}** (${member.username}): ${member.roleCount} roles\n`;
+                });
+              }
+
+              db.all(`SELECT COUNT(*) as totalRoles FROM guild_roles WHERE deleted = 0`, [], async (err, roleCountResult) => {
+  if (err) throw err;
+
+  db.all(`SELECT name, color, position, mentionable, hoist FROM guild_roles WHERE deleted = 0 ORDER BY position DESC LIMIT 15`, [], async (err, roleDetailResult) => {
+    if (err) throw err;
+    
+    // Add this to your response:
+    response += `\n## Role Statistics\n`;
+    response += `**Total Roles:** ${roleCountResult[0].totalRoles}\n\n`;
+    
+    if (roleDetailResult.length > 0) {
+      response += `### Top ${roleDetailResult.length} Roles (by hierarchy)\n`;
+      roleDetailResult.forEach(role => {
+        // Add emoji indicators for special properties
+        const hoistEmoji = role.hoist ? '📌' : ''; // Hoisted/displayed separately
+        const mentionEmoji = role.mentionable ? '🔔' : ''; // Mentionable
+        
+        response += `- ${hoistEmoji}${mentionEmoji} **${role.name}** (Position: ${role.position})\n`;
+      });
+    } else {
+      response += "*No role data available*\n";
+    }
+    
+    // Continue with updating the status message
+  });
+});
+			  
+              // Add timestamp to the report
+              response += `\n\n*Report generated: ${getFormattedDateTime()} UTC*`;
+              
+              // Update the status message with the statistics
+              await statusMessage.edit(response);
+              
+              // Log successful completion
+              console.log(`[${getFormattedDateTime()}] Completed: !memberstats for ${message.guild.name} (${message.guild.id})`);
+            });
+          });
+        });
+      });
+    } catch (error) {
+      console.error(`[${getFormattedDateTime()}] Error: !memberstats command failed:`, error);
+      message.channel.send(`Error generating member statistics: ${error.message}`);
+    } finally {
+      // Remove guild from active operations when done
+      activeOperations.delete(message.guildId);
+    }
   }
 });
 

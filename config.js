@@ -64,6 +64,9 @@ const config = {
   // Whether automatic channel monitoring is enabled
   channelMonitoringEnabled: true,
   
+  // Number of members to process in each batch
+memberBatchSize: 300,
+  
   // Helper function to get environment variables or use defaults from this config
   getConfig: function(key, envName) {
     // If environment variable exists, use it, otherwise use config value
