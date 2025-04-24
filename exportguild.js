@@ -331,6 +331,21 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
     return;
   }
   
+  // IMPORTANT: Initialize lastStoredMessageId here first before using it
+  let lastStoredMessageId = null;
+  
+  try {
+    // Get channel info from database before marking as fetching started
+    const channelInfo = await getChannelInfo(channel.id);
+    if (channelInfo && channelInfo.lastMessageId) {
+      lastStoredMessageId = channelInfo.lastMessageId;
+      console.log(`Found existing messages for channel ${channel.name} (${channel.id}), last message ID: ${lastStoredMessageId}`);
+    }
+  } catch (error) {
+    console.error(`Error checking for existing messages in channel ${channel.name}:`, error);
+  }
+  
+  // Now mark the channel as fetching started AFTER we've retrieved the lastStoredMessageId
   await monitor.markChannelFetchingStarted(channel.id, channel.name);
   console.log(`Marked channel ${channel.name} (${channel.id}) for monitoring`);
   
@@ -347,6 +362,7 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
   let currentBatchSpeed = 0;
   
   console.log(`Starting to fetch messages from channel: ${channel.name} (${channel.id})`);
+  console.log(`Last stored message ID: ${lastStoredMessageId || 'None'}`);
   
   while (keepFetching) {
     try {
@@ -405,6 +421,70 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
       
       // Save the last message ID for pagination
       lastMessageId = messages.last().id;
+      
+      // Check if we've reached previously fetched messages
+      if (lastStoredMessageId && lastMessageId) {
+        try {
+          console.log(`Comparing message IDs in ${channel.name}:`);
+          console.log(`  Current batch last message ID: "${lastMessageId}" (length: ${lastMessageId.length})`);
+          console.log(`  Stored last message ID: "${lastStoredMessageId}" (length: ${lastStoredMessageId.length})`);
+          
+          const currentIdBigInt = BigInt(lastMessageId);
+          const storedIdBigInt = BigInt(lastStoredMessageId);
+          const compareResult = currentIdBigInt <= storedIdBigInt;
+          
+          console.log(`  Comparison result (current <= stored): ${compareResult}`);
+          
+          if (compareResult) {
+            console.log(`Reached previously fetched messages in ${channel.name}, stopping fetch`);
+            keepFetching = false;
+            
+            // Process only messages that are newer than lastStoredMessageId
+            const newMessages = Array.from(messages.values())
+              .filter(msg => {
+                try {
+                  return BigInt(msg.id) > storedIdBigInt;
+                } catch (err) {
+                  console.error(`Error comparing message ID ${msg.id}:`, err);
+                  return false; // Skip on error
+                }
+              });
+            
+            console.log(`Found ${newMessages.length} new messages since last fetch`);
+            
+            // Continue with only the new messages
+            const nonBotMessages = newMessages.filter(message => !message.author.bot);
+            exportState.messageDroppedCount += (newMessages.length - nonBotMessages.length);
+            exportState.messagesTotalProcessed += newMessages.length;
+            
+            // Process each non-bot message
+            for (const message of nonBotMessages) {
+              messageBatch.push(message);
+              exportState.messagesInCurrentChannel++;
+              exportState.processedMessages++;
+            }
+            
+            // Flush any remaining messages in the batch
+            if (messageBatch.length > 0) {
+              try {
+                console.log(`Inserting final batch of ${messageBatch.length} new messages into database`);
+                await monitor.storeMessagesInDbBatch(messageBatch);
+                exportState.messagesStoredInDb += messageBatch.length;
+                messageBatch = [];
+              } catch (dbError) {
+                console.error('Error inserting message batch into database:', dbError);
+                exportState.dbErrors++;
+              }
+            }
+            
+            continue;
+          }
+        } catch (idError) {
+          console.error(`Error comparing message IDs in ${channel.name}:`, idError);
+          console.error(`lastMessageId: "${lastMessageId}", lastStoredMessageId: "${lastStoredMessageId}"`);
+          // Continue fetching on error
+        }
+      }
       
       // Track all messages encountered
       exportState.messagesTotalProcessed += messages.size;
@@ -536,9 +616,37 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
     }
   }
   
-  // Mark channel as fetching completed in database with last message ID
-await monitor.markChannelFetchingCompleted(channel.id, lastMessageId);
+  // IMPORTANT: Preserve the lastMessageId when marking as completed
+  await monitor.markChannelFetchingCompleted(channel.id, lastMessageId || lastStoredMessageId);
   console.log(`Completed monitoring setup for channel: ${channel.name} (${channel.id})`);
+}
+
+// Helper function to get channel info from the database with proper sanitization
+async function getChannelInfo(channelId) {
+  return new Promise((resolve, reject) => {
+    const db = monitor.getDatabase();
+    if (!db) {
+      console.log("Database not initialized, returning null");
+      resolve(null);
+      return;
+    }
+    
+    const sql = `
+      SELECT id, name, fetchStarted, lastMessageId
+      FROM channels
+      WHERE id = ?
+    `;
+    
+    db.get(sql, [channelId], (err, row) => {
+      if (err) {
+        console.error('Error getting channel info:', err);
+        reject(err);
+        return;
+      }
+      
+      resolve(row || null);
+    });
+  });
 }
 
 // Extract message metadata - this function is still needed for monitor.js

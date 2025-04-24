@@ -157,14 +157,13 @@ function initializeDatabase(guild = null) {
         }
         
         // Create channels table to track which channels have been fetched
+        // Removed fetchCompleted and lastFetchTimestamp fields
         db.run(`
   CREATE TABLE IF NOT EXISTS channels (
     id TEXT PRIMARY KEY,
     name TEXT,
     fetchStarted INTEGER DEFAULT 0,
-    fetchCompleted INTEGER DEFAULT 0,
     lastMessageId TEXT,
-    lastFetchTimestamp INTEGER,
     deleted INTEGER DEFAULT 0,
     deletedAt INTEGER
   )
@@ -559,18 +558,17 @@ function markChannelFetchingStarted(channelId, channelName) {
     
     fetchingInProgress.add(channelId);
     
+    // Update SQL removing fetchCompleted and lastFetchTimestamp fields
     const sql = `
       INSERT OR REPLACE INTO channels 
-      (id, name, fetchStarted, fetchCompleted, lastFetchTimestamp) 
-      VALUES (?, ?, ?, ?, ?)
+      (id, name, fetchStarted) 
+      VALUES (?, ?, ?)
     `;
     
     db.run(sql, [
       channelId,
       channelName,
-      1, // fetch started
-      0, // fetch not completed
-      Date.now()
+      1 // fetch started
     ], function(err) {
       if (err) {
         console.error(`Error marking channel ${channelId} as fetching started:`, err);
@@ -594,15 +592,15 @@ function markChannelFetchingCompleted(channelId, lastMessageId = null) {
     fetchingInProgress.delete(channelId);
     fetchingComplete.add(channelId);
     
+    // Update SQL to set fetchStarted to 1 and lastMessageId
     const sql = `
       UPDATE channels 
-      SET fetchCompleted = 1, lastMessageId = ?, lastFetchTimestamp = ?
+      SET fetchStarted = 1, lastMessageId = ?
       WHERE id = ?
     `;
     
     db.run(sql, [
       lastMessageId,
-      Date.now(),
       channelId
     ], function(err) {
       if (err) {
@@ -681,8 +679,9 @@ async function getFetchedChannels() {
       return;
     }
     
+    // Update SQL removing fetchCompleted and lastFetchTimestamp fields
     const sql = `
-      SELECT id, name, fetchStarted, fetchCompleted, lastMessageId, lastFetchTimestamp
+      SELECT id, name, fetchStarted, lastMessageId
       FROM channels
       WHERE fetchStarted = 1
     `;
@@ -714,16 +713,13 @@ async function loadFetchedChannelsState() {
     
     // Populate the fetchingComplete set from the database
     for (const channel of channels) {
-      if (channel.fetchCompleted === 1) {
-        console.log(`Adding previously fetched channel to monitoring: ${channel.name} (${channel.id})`);
-        fetchingComplete.add(channel.id);
-      } else if (channel.fetchStarted === 1 && channel.fetchCompleted === 0) {
-        console.log(`Adding in-progress channel to monitoring: ${channel.name} (${channel.id})`);
-        fetchingInProgress.add(channel.id);
-      }
+      console.log(`Adding channel to monitoring: ${channel.name} (${channel.id})`);
+      // Since fetchCompleted is removed, all channels with fetchStarted=1 
+      // are considered complete
+      fetchingComplete.add(channel.id);
     }
     
-    console.log(`Loaded ${fetchingComplete.size} completed channels and ${fetchingInProgress.size} in-progress channels for monitoring`);
+    console.log(`Loaded ${fetchingComplete.size} channels for monitoring`);
   } catch (error) {
     console.error('Error loading fetched channels state:', error);
   }
