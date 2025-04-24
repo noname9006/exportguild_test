@@ -558,25 +558,50 @@ function markChannelFetchingStarted(channelId, channelName) {
     
     fetchingInProgress.add(channelId);
     
-    // Update SQL removing fetchCompleted and lastFetchTimestamp fields
-    const sql = `
-      INSERT OR REPLACE INTO channels 
-      (id, name, fetchStarted) 
-      VALUES (?, ?, ?)
+    // First, check if we already have a lastMessageId for this channel
+    const checkSql = `
+      SELECT lastMessageId
+      FROM channels
+      WHERE id = ?
     `;
     
-    db.run(sql, [
-      channelId,
-      channelName,
-      1 // fetch started
-    ], function(err) {
+    db.get(checkSql, [channelId], (err, row) => {
       if (err) {
-        console.error(`Error marking channel ${channelId} as fetching started:`, err);
+        console.error(`Error checking existing channel data for ${channelId}:`, err);
         reject(err);
         return;
       }
       
-      resolve(true);
+      // Get any existing lastMessageId
+      const existingLastMessageId = row ? row.lastMessageId : null;
+      
+      // Now update the channel but preserve lastMessageId if it exists
+      const updateSql = existingLastMessageId
+        ? `
+          INSERT OR REPLACE INTO channels 
+          (id, name, fetchStarted, lastMessageId) 
+          VALUES (?, ?, ?, ?)
+        `
+        : `
+          INSERT OR REPLACE INTO channels 
+          (id, name, fetchStarted) 
+          VALUES (?, ?, ?)
+        `;
+      
+      const params = existingLastMessageId
+        ? [channelId, channelName, 1, existingLastMessageId]
+        : [channelId, channelName, 1];
+      
+      db.run(updateSql, params, function(err) {
+        if (err) {
+          console.error(`Error marking channel ${channelId} as fetching started:`, err);
+          reject(err);
+          return;
+        }
+        
+        console.log(`Marked channel ${channelName} (${channelId}) as fetching started${existingLastMessageId ? ` with existing lastMessageId: ${existingLastMessageId}` : ''}`);
+        resolve(true);
+      });
     });
   });
 }

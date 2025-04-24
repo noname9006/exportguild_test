@@ -325,6 +325,35 @@ async function processChannelsInParallel(channels, exportState, statusMessage, g
   }
 }
 
+// Helper function to get channel info from the database with proper sanitization
+async function getChannelInfo(channelId) {
+  return new Promise((resolve, reject) => {
+    const db = monitor.getDatabase();
+    if (!db) {
+      console.log("Database not initialized, returning null");
+      resolve(null);
+      return;
+    }
+    
+    const sql = `
+      SELECT id, name, fetchStarted, lastMessageId
+      FROM channels
+      WHERE id = ?
+    `;
+    
+    db.get(sql, [channelId], (err, row) => {
+      if (err) {
+        console.error('Error getting channel info:', err);
+        reject(err);
+        return;
+      }
+      
+      resolve(row || null);
+    });
+  });
+}
+
+// fetchMessagesFromChannel function in exportguild.js - CORRECTED VERSION
 async function fetchMessagesFromChannel(channel, exportState, statusMessage, guild) {
   if (!channel.isTextBased()) {
     console.log(`Skipping non-text channel: ${channel.name}`);
@@ -363,7 +392,174 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
   
   console.log(`Starting to fetch messages from channel: ${channel.name} (${channel.id})`);
   console.log(`Last stored message ID: ${lastStoredMessageId || 'None'}`);
+
+  // Debug information to help diagnose issues
+  console.log(`DEBUG: Starting message fetch for ${channel.name}`);
+  console.log(`DEBUG: lastStoredMessageId = ${lastStoredMessageId}`);
+  console.log(`DEBUG: lastStoredMessageId type = ${typeof lastStoredMessageId}`);
+  console.log(`DEBUG: lastStoredMessageId length = ${lastStoredMessageId ? lastStoredMessageId.length : 'N/A'}`);
+
+  // Test conversion to BigInt to check if it's valid
+  try {
+    if (lastStoredMessageId) {
+      const testBigInt = BigInt(lastStoredMessageId);
+      console.log(`DEBUG: lastStoredMessageId converts to BigInt successfully: ${testBigInt}`);
+    } else {
+      console.log(`DEBUG: Cannot convert lastStoredMessageId to BigInt - value is null or undefined`);
+    }
+  } catch (err) {
+    console.error(`DEBUG: Error converting lastStoredMessageId to BigInt: ${err.message}`);
+    // If we can't convert to BigInt, clear it to use standard fetch method
+    lastStoredMessageId = null;
+  }
+
+  // If we have a lastStoredMessageId, fetch only messages AFTER that ID using pagination
+  if (lastStoredMessageId) {
+    try {
+      console.log(`Using pagination to fetch messages after ID: ${lastStoredMessageId} in ${channel.name}`);
+      
+      // Start with an empty array to collect all new messages
+      let newMessages = [];
+      
+      // We'll fetch in reverse chronological order (newest first)
+      let currentAfter = lastStoredMessageId;
+      let hasMoreMessages = true;
+      let batchCount = 0;
+      
+      // Keep fetching batches of messages until we've got them all
+      while (hasMoreMessages) {
+        batchCount++;
+        console.log(`Fetching batch ${batchCount} of newer messages with after=${currentAfter} in ${channel.name}`);
+        
+        // Use the after parameter to get messages newer than our reference point
+        const messages = await channel.messages.fetch({ 
+          limit: 100,
+          after: currentAfter
+        });
+        
+        console.log(`Fetched ${messages.size} messages after ${currentAfter} in ${channel.name}`);
+        
+        // If no messages, we're done
+        if (messages.size === 0) {
+          hasMoreMessages = false;
+          console.log(`No more new messages in ${channel.name} after batch ${batchCount}`);
+          continue;
+        }
+        
+        // Discord returns newest-first when using "after", but we want oldest-first for processing
+        // So add them in the right order
+        const messagesArray = Array.from(messages.values());
+        
+        // Sort by ID ascending (oldest first)
+        messagesArray.sort((a, b) => BigInt(a.id) - BigInt(b.id));
+        
+        // Add these messages to our collection
+        newMessages = [...newMessages, ...messagesArray];
+        console.log(`Added ${messagesArray.length} messages, total now: ${newMessages.length}`);
+        
+        // Update the reference point to get the next batch
+        // We need the highest ID (newest message) for the next "after" query
+        const highestId = messagesArray.reduce((max, msg) => 
+          BigInt(msg.id) > BigInt(max) ? msg.id : max, 
+          messagesArray[0].id
+        );
+        
+        currentAfter = highestId;
+        console.log(`Updated currentAfter to ${currentAfter} for next batch`);
+        
+        // Discord pagination with "after" gives us newest messages first in each batch
+        // If we got less than 100, we've reached the end
+        if (messages.size < 100) {
+          hasMoreMessages = false;
+          console.log(`Reached newest messages for ${channel.name} after ${batchCount} batches`);
+        }
+
+        // Check memory usage occasionally
+        if (batchCount % 5 === 0) {
+          const memoryExceeded = await checkAndHandleMemoryUsage(exportState, 'PAGINATION_FETCH');
+          if (memoryExceeded) {
+            console.log(`Memory limit reached during pagination. Will continue but may need cleanup.`);
+          }
+        }
+      }
+      
+      // Final count of all new messages
+      console.log(`Total new messages found in ${channel.name}: ${newMessages.length}`);
+      
+      // If no new messages, we're done with this channel
+      if (newMessages.length === 0) {
+        console.log(`No new messages in ${channel.name} since last fetch`);
+        // Preserve the existing lastMessageId since nothing has changed
+        await monitor.markChannelFetchingCompleted(channel.id, lastStoredMessageId);
+        console.log(`Completed monitoring setup for channel: ${channel.name} (${channel.id}) - no changes`);
+        return;
+      }
+      
+      // Find the highest (newest) message ID for the updated lastMessageId
+      const highestMessageId = newMessages.reduce((max, msg) => 
+        BigInt(msg.id) > BigInt(max) ? msg.id : max, 
+        newMessages[0].id
+      );
+      
+      // Filter out bot messages
+      const nonBotMessages = newMessages.filter(message => !message.author.bot);
+      exportState.messageDroppedCount += (newMessages.length - nonBotMessages.length);
+      exportState.messagesTotalProcessed += newMessages.length;
+      
+      console.log(`Found ${nonBotMessages.length} new non-bot messages in ${channel.name}`);
+      
+      // Process and store these messages in batches
+      const DB_BATCH_SIZE = exportState.dbBatchSize;
+      for (let i = 0; i < nonBotMessages.length; i += DB_BATCH_SIZE) {
+        const batch = nonBotMessages.slice(i, i + DB_BATCH_SIZE);
+        try {
+          console.log(`Storing batch of ${batch.length} messages from ${channel.name}`);
+          await monitor.storeMessagesInDbBatch(batch);
+          exportState.messagesStoredInDb += batch.length;
+          exportState.messagesInCurrentChannel += batch.length;
+          exportState.processedMessages += batch.length;
+        } catch (dbError) {
+          console.error(`Error storing messages batch from ${channel.name}:`, dbError);
+          exportState.dbErrors++;
+          
+          // Try individual storage if batch fails
+          for (const msg of batch) {
+            try {
+              await monitor.storeMessageInDb(msg);
+              exportState.messagesStoredInDb++;
+              exportState.messagesInCurrentChannel++;
+              exportState.processedMessages++;
+            } catch (singleError) {
+              console.error(`Error storing message ${msg.id}:`, singleError);
+              exportState.dbErrors++;
+            }
+          }
+        }
+        
+        // Update status message
+        const currentTime = Date.now();
+        if (currentTime - exportState.lastStatusUpdateTime > STATUS_UPDATE_INTERVAL) {
+          exportState.lastStatusUpdateTime = currentTime;
+          updateStatusMessage(statusMessage, exportState, guild);
+        }
+      }
+      
+      // Update the channel with the new lastMessageId
+      console.log(`Setting new lastMessageId to ${highestMessageId} for channel ${channel.name} (old ID: ${lastStoredMessageId})`);
+      await monitor.markChannelFetchingCompleted(channel.id, highestMessageId);
+      console.log(`Completed monitoring setup for channel: ${channel.name} (${channel.id}) with updated lastMessageId`);
+      return;
+      
+    } catch (error) {
+      console.error(`Error during "after" pagination in ${channel.name}:`, error);
+      console.log(`Falling back to standard fetch method for ${channel.name}`);
+      // If the pagination approach fails, fall back to the standard method
+    }
+  }
   
+  // Standard fetching logic (original code) follows for channels without lastStoredMessageId
+  // or if pagination for newer messages failed
+  console.log(`Using standard fetch method for ${channel.name} - either no lastStoredMessageId or pagination failed`);
   while (keepFetching) {
     try {
       // Check memory usage every 5 fetch operations
@@ -621,34 +817,6 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
   console.log(`Completed monitoring setup for channel: ${channel.name} (${channel.id})`);
 }
 
-// Helper function to get channel info from the database with proper sanitization
-async function getChannelInfo(channelId) {
-  return new Promise((resolve, reject) => {
-    const db = monitor.getDatabase();
-    if (!db) {
-      console.log("Database not initialized, returning null");
-      resolve(null);
-      return;
-    }
-    
-    const sql = `
-      SELECT id, name, fetchStarted, lastMessageId
-      FROM channels
-      WHERE id = ?
-    `;
-    
-    db.get(sql, [channelId], (err, row) => {
-      if (err) {
-        console.error('Error getting channel info:', err);
-        reject(err);
-        return;
-      }
-      
-      resolve(row || null);
-    });
-  });
-}
-
 // Extract message metadata - this function is still needed for monitor.js
 function extractMessageMetadata(message) {
   // Format with all relevant message data
@@ -869,9 +1037,22 @@ async function handleExportGuild(message, client) {
     
     // Store channel metadata in database
     for (const channelObj of allChannels) {
-      const channel = channelObj.channel;
-      await monitor.markChannelFetchingStarted(channel.id, channel.name);
-    }
+  const channel = channelObj.channel;
+  try {
+    // Get any existing channel info before updating
+    const channelInfo = await getChannelInfo(channel.id);
+    
+    // If the channel exists and has a lastMessageId, use markChannelFetchingStarted
+    // which will preserve the lastMessageId
+    await monitor.markChannelFetchingStarted(channel.id, channel.name);
+    
+    console.log(`Updated channel info for ${channel.name} (${channel.id})${
+      channelInfo && channelInfo.lastMessageId ? ` with existing lastMessageId: ${channelInfo.lastMessageId}` : ''
+    }`);
+  } catch (error) {
+    console.error(`Error updating channel info for ${channel.name} (${channel.id}):`, error);
+  }
+}
     
     // Process channels in parallel with controlled concurrency
     await processChannelsInParallel(allChannels, exportState, statusMessage, guild);
