@@ -617,24 +617,120 @@ function markChannelFetchingCompleted(channelId, lastMessageId = null) {
     fetchingInProgress.delete(channelId);
     fetchingComplete.add(channelId);
     
-    // Update SQL to set fetchStarted to 1 and lastMessageId
-    const sql = `
-      UPDATE channels 
-      SET fetchStarted = 1, lastMessageId = ?
-      WHERE id = ?
-    `;
+    // Clean and validate the lastMessageId
+    if (lastMessageId !== null && lastMessageId !== undefined) {
+      // Remove any spaces from the ID and ensure it's a string
+      lastMessageId = String(lastMessageId).replace(/\s+/g, '');
+      
+      // Make sure the ID is actually numeric
+      if (!/^\d+$/.test(lastMessageId)) {
+        console.error(`Invalid lastMessageId format detected: "${lastMessageId}"`);
+        lastMessageId = null; // Don't use an invalid ID
+      }
+    }
     
-    db.run(sql, [
-      lastMessageId,
-      channelId
-    ], function(err) {
+    // Get channel name for logging
+    let channelName = channelId;
+    db.get("SELECT name FROM channels WHERE id = ?", [channelId], (err, row) => {
+      if (!err && row) {
+        channelName = row.name;
+      }
+      
+      // Update SQL to set fetchStarted to 1 and lastMessageId
+      const sql = `
+        UPDATE channels 
+        SET fetchStarted = 1, lastMessageId = ?
+        WHERE id = ?
+      `;
+      
+      db.run(sql, [
+        lastMessageId,
+        channelId
+      ], function(err) {
+        if (err) {
+          console.error(`Error marking channel ${channelId} as fetching completed:`, err);
+          reject(err);
+          return;
+        }
+        
+        console.log(`Marked channel ${channelName} (${channelId}) as fetching completed with lastMessageId: ${lastMessageId}`);
+        resolve(true);
+      });
+    });
+  });
+}
+
+async function fixExistingLastMessageIds() {
+  return new Promise((resolve, reject) => {
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
+    // First get all channels with lastMessageId to check for issues
+    const selectSql = `SELECT id, name, lastMessageId FROM channels WHERE lastMessageId IS NOT NULL`;
+    
+    db.all(selectSql, [], (err, rows) => {
       if (err) {
-        console.error(`Error marking channel ${channelId} as fetching completed:`, err);
+        console.error('Error getting channels with lastMessageId:', err);
         reject(err);
         return;
       }
       
-      resolve(true);
+      console.log(`Found ${rows.length} channels with lastMessageId values to check`);
+      
+      // Process each channel with a lastMessageId
+      const updates = [];
+      for (const row of rows) {
+        const channelId = row.id;
+        const channelName = row.name || channelId;
+        const lastMessageId = row.lastMessageId;
+        
+        // Skip if lastMessageId is already clean
+        if (lastMessageId && /^\d+$/.test(lastMessageId)) {
+          continue;
+        }
+        
+        // Clean the lastMessageId by removing spaces
+        const cleanLastMessageId = lastMessageId ? String(lastMessageId).replace(/\s+/g, '') : null;
+        
+        // Skip if cleaning removed all characters or made it invalid
+        if (!cleanLastMessageId || cleanLastMessageId === '' || !/^\d+$/.test(cleanLastMessageId)) {
+          console.log(`Warning: Cannot clean invalid lastMessageId "${lastMessageId}" for channel ${channelName} (${channelId})`);
+          continue;
+        }
+        
+        // If the lastMessageId needed cleaning, add it to our updates
+        if (cleanLastMessageId !== lastMessageId) {
+          console.log(`Will fix lastMessageId for ${channelName} (${channelId}): "${lastMessageId}" -> "${cleanLastMessageId}"`);
+          
+          updates.push(new Promise((resolveUpdate, rejectUpdate) => {
+            const updateSql = `UPDATE channels SET lastMessageId = ? WHERE id = ?`;
+            
+            db.run(updateSql, [cleanLastMessageId, channelId], function(updateErr) {
+              if (updateErr) {
+                console.error(`Error fixing lastMessageId for channel ${channelName} (${channelId}):`, updateErr);
+                rejectUpdate(updateErr);
+                return;
+              }
+              
+              console.log(`Fixed lastMessageId for channel ${channelName} (${channelId}): "${lastMessageId}" -> "${cleanLastMessageId}"`);
+              resolveUpdate();
+            });
+          }));
+        }
+      }
+      
+      // Wait for all updates to complete
+      Promise.all(updates)
+        .then(() => {
+          console.log(`Completed fixing ${updates.length} channels with invalid lastMessageId values`);
+          resolve(updates.length);
+        })
+        .catch(fixErr => {
+          console.error('Error during lastMessageId fixes:', fixErr);
+          reject(fixErr);
+        });
     });
   });
 }
@@ -821,5 +917,6 @@ module.exports = {
   extractMessageMetadata,
   generateDbFilename,
   getCurrentDatabasePath,
-  getDatabase
+  getDatabase,
+  fixExistingLastMessageIds
 };

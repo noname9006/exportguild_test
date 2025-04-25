@@ -54,38 +54,48 @@ client.once('ready', async () => {
     }
     
     // For each guild the bot is connected to, check if a database exists
-    for (const [guildId, guild] of client.guilds.cache) {
+for (const [guildId, guild] of client.guilds.cache) {
+  try {
+    // This will check if a database exists without creating one
+    const dbExists = monitor.checkDatabaseExists(guild);
+    if (dbExists) {
+      console.log(`Found existing database for guild ${guild.name} (${guild.id})`);
+      
+      // Initialize database with existing file
+      await monitor.initializeDatabase(guild);
+      
+      // Fix lastMessageId values for this specific guild's database
       try {
-        // This will check if a database exists without creating one
-        const dbExists = monitor.checkDatabaseExists(guild);
-        if (dbExists) {
-          console.log(`Found existing database for guild ${guild.name} (${guild.id})`);
-          // Initialize database with existing file
-          await monitor.initializeDatabase(guild);
-          
-          // Get the database instance from monitor instead of using global db
-          const db = monitor.getDatabase();
-          
-          // Initialize WAL manager with the database from monitor
-          if (db) {
-            await walManager.initialize(client, db);
-            
-            // Initialize member tracking tables in the database
-            await memberTracker.initializeMemberDatabase(db);
-            
-            // Mark guild as initialized
-            initializedGuilds.add(guildId);
-            console.log(`Database initialized for guild ${guild.name} (${guild.id}), monitoring active`);
-          } else {
-            console.error(`Database not available for guild ${guild.name} after initialization`);
-          }
-        } else {
-          console.log(`No database found for guild ${guild.name} (${guild.id}). Will create one when !exportguild is used.`);
-        }
+        await monitor.fixExistingLastMessageIds();
+        console.log(`Completed checking and fixing lastMessageId values for guild ${guild.name} (${guild.id})`);
       } catch (error) {
-        console.error(`Error checking database for guild ${guild.name} (${guild.id}):`, error);
+        console.error(`Error fixing lastMessageId values for guild ${guild.name} (${guild.id}):`, error);
       }
+      
+      // Get the database instance from monitor instead of using global db
+      const db = monitor.getDatabase();
+      
+      // Initialize WAL manager with the database from monitor
+      if (db) {
+        await walManager.initialize(client, db);
+        
+        // Initialize member tracking tables in the database
+        await memberTracker.initializeMemberDatabase(db);
+        
+        // Mark guild as initialized
+        initializedGuilds.add(guildId);
+        console.log(`Database initialized for guild ${guild.name} (${guild.id}), monitoring active`);
+      } else {
+        console.error(`Database not available for guild ${guild.name} after initialization`);
+      }
+    } else {
+      console.log(`No database found for guild ${guild.name} (${guild.id}). Will create one when !exportguild is used.`);
     }
+  } catch (error) {
+    console.error(`Error checking database for guild ${guild.name} (${guild.id}):`, error);
+  }
+}
+
 	  
     // Initialize auto-vacuum schedule
     autoVacuum.initializeAutoVacuum(client, {
@@ -108,6 +118,8 @@ client.once('ready', async () => {
   } catch (error) {
     console.error('Error during startup:', error);
   }
+  
+  
 });
 
 // Function to handle excluded channels commands

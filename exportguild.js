@@ -1,4 +1,3 @@
-// exportguild.js - Functions for exporting Discord guild data
 const path = require('path');
 const { 
   PermissionFlagsBits,
@@ -426,6 +425,9 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
       let hasMoreMessages = true;
       let batchCount = 0;
       
+      // Track the highest message ID (newest message)
+      let highestMessageId = null;
+      
       // Keep fetching batches of messages until we've got them all
       while (hasMoreMessages) {
         batchCount++;
@@ -446,25 +448,46 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
           continue;
         }
         
+        // For the first batch, the newest message will be the first one in the collection
+        // (Discord returns newest-first when using "after")
+        if (batchCount === 1 && messages.size > 0) {
+          // Get the first message from the collection (newest one)
+          const newestMessage = messages.first();
+          highestMessageId = newestMessage.id;
+          console.log(`Identified newest message ID: ${highestMessageId} from first batch`);
+        } else if (messages.size > 0) {
+          // Check if any message in this batch is newer than our current highest
+          const currentBatchNewest = messages.first().id;
+          
+          // Compare as BigInt to ensure proper numerical comparison
+          if (!highestMessageId || BigInt(currentBatchNewest) > BigInt(highestMessageId)) {
+            highestMessageId = currentBatchNewest;
+            console.log(`Updated highest message ID to: ${highestMessageId} from batch ${batchCount}`);
+          }
+        }
+        
         // Discord returns newest-first when using "after", but we want oldest-first for processing
         // So add them in the right order
         const messagesArray = Array.from(messages.values());
         
         // Sort by ID ascending (oldest first)
-        messagesArray.sort((a, b) => BigInt(a.id) - BigInt(b.id));
+        messagesArray.sort((a, b) => {
+          const aId = BigInt(a.id);
+          const bId = BigInt(b.id);
+          return aId < bId ? -1 : aId > bId ? 1 : 0;
+        });
         
         // Add these messages to our collection
         newMessages = [...newMessages, ...messagesArray];
         console.log(`Added ${messagesArray.length} messages, total now: ${newMessages.length}`);
         
         // Update the reference point to get the next batch
-        // We need the highest ID (newest message) for the next "after" query
-        const highestId = messagesArray.reduce((max, msg) => 
-          BigInt(msg.id) > BigInt(max) ? msg.id : max, 
-          messagesArray[0].id
-        );
+        // We need the highest ID (newest message) from this batch for the next "after" query
+        const batchHighestId = messagesArray.reduce((max, msg) => {
+          return BigInt(msg.id) > BigInt(max) ? msg.id : max;
+        }, messagesArray[0].id);
         
-        currentAfter = highestId;
+        currentAfter = batchHighestId;
         console.log(`Updated currentAfter to ${currentAfter} for next batch`);
         
         // Discord pagination with "after" gives us newest messages first in each batch
@@ -495,11 +518,12 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
         return;
       }
       
-      // Find the highest (newest) message ID for the updated lastMessageId
-      const highestMessageId = newMessages.reduce((max, msg) => 
-        BigInt(msg.id) > BigInt(max) ? msg.id : max, 
-        newMessages[0].id
-      );
+      // Use the highest message ID we tracked during fetching
+      // Make sure it's clean
+      if (highestMessageId) {
+        // Make sure it's a clean string with no spaces
+        highestMessageId = String(highestMessageId).replace(/\s+/g, '');
+      }
       
       // Filter out bot messages
       const nonBotMessages = newMessages.filter(message => !message.author.bot);
@@ -560,6 +584,11 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
   // Standard fetching logic (original code) follows for channels without lastStoredMessageId
   // or if pagination for newer messages failed
   console.log(`Using standard fetch method for ${channel.name} - either no lastStoredMessageId or pagination failed`);
+  
+  // For the standard fetch method, we need to track the newest message ID
+  // This will be different from lastMessageId which is used for pagination
+  let newestMessageId = null;
+  
   while (keepFetching) {
     try {
       // Check memory usage every 5 fetch operations
@@ -613,6 +642,13 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
         }
         
         continue;
+      }
+      
+      // If we're on the first batch, find the newest message
+      // With standard fetch without 'before' parameter, the newest message is first
+      if (fetchCount === 1 && !options.before) {
+        newestMessageId = messages.first().id;
+        console.log(`First batch has newest message ID: ${newestMessageId}`);
       }
       
       // Save the last message ID for pagination
@@ -812,8 +848,17 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
     }
   }
   
-  // IMPORTANT: Preserve the lastMessageId when marking as completed
-  await monitor.markChannelFetchingCompleted(channel.id, lastMessageId || lastStoredMessageId);
+  // IMPORTANT: For standard fetching, we want to store either:
+  // 1. The newest message ID if we found one
+  // 2. The current lastMessageId we used for pagination
+  // 3. The previously stored ID as fallback
+  const idToStore = newestMessageId || lastMessageId || lastStoredMessageId;
+  
+  // Clean the ID to ensure no spaces
+  const cleanIdToStore = idToStore ? String(idToStore).replace(/\s+/g, '') : null;
+  
+  console.log(`Standard fetch completed. Saving lastMessageId: ${cleanIdToStore}`);
+  await monitor.markChannelFetchingCompleted(channel.id, cleanIdToStore);
   console.log(`Completed monitoring setup for channel: ${channel.name} (${channel.id})`);
 }
 
