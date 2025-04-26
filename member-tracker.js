@@ -252,7 +252,7 @@ async function storeMemberRolesInDb(member) {
   });
 }
 
-// Store multiple members' roles in a batch transaction
+// Store multiple members' roles in a batch transaction - FIXED VERSION
 async function storeMemberRolesInDbBatch(members) {
   return new Promise((resolve, reject) => {
     const db = monitor.getDatabase();
@@ -264,68 +264,58 @@ async function storeMemberRolesInDbBatch(members) {
     const currentTime = Date.now();
     let totalRolesAdded = 0;
     
-    // Start transaction
-    db.serialize(() => {
-      db.run('BEGIN TRANSACTION');
-      
-      // Prepare delete statement for reuse
-      const deleteStmt = db.prepare(`DELETE FROM member_roles WHERE memberId = ?`);
-      
-      // Prepare insert statement for reuse
-      const insertStmt = db.prepare(`
-        INSERT INTO member_roles (
-          memberId, roleId, roleName, roleColor, rolePosition, addedAt
-        ) VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      
-      // Process each member
-      for (const member of members) {
-        if (!member || !member.roles || !member.roles.cache) {
-          console.log(`Skipping invalid member`);
-          continue;
-        }
-        
-        const roles = Array.from(member.roles.cache.values());
-        const filteredRoles = roles.filter(role => role.id !== member.guild.id);
-        
-        if (filteredRoles.length === 0) {
-          console.log(`Member ${member.user.username} has no roles to store (besides @everyone)`);
-          continue;
-        }
-        
-        // Delete existing roles
-        deleteStmt.run(member.id);
-        
-        // Insert each role
-        for (const role of filteredRoles) {
-          insertStmt.run(
-            member.id,
-            role.id,
-            role.name,
-            role.hexColor,
-            role.position,
-            currentTime
-          );
-          totalRolesAdded++;
-        }
+    // No transaction here - rely on the outer transaction
+    
+    // Prepare delete statement for reuse
+    const deleteStmt = db.prepare(`DELETE FROM member_roles WHERE memberId = ?`);
+    
+    // Prepare insert statement for reuse
+    const insertStmt = db.prepare(`
+      INSERT INTO member_roles (
+        memberId, roleId, roleName, roleColor, rolePosition, addedAt
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    
+    // Process each member
+    for (const member of members) {
+      if (!member || !member.roles || !member.roles.cache) {
+        console.log(`Skipping invalid member`);
+        continue;
       }
       
-      // Finalize statements
-      deleteStmt.finalize();
-      insertStmt.finalize();
+      const roles = Array.from(member.roles.cache.values());
+      const filteredRoles = roles.filter(role => role.id !== member.guild.id);
       
-      // Commit transaction
-      db.run('COMMIT', function(err) {
-        if (err) {
-          console.error('Error committing transaction:', err);
-          db.run('ROLLBACK');
-          reject(err);
-        } else {
-          console.log(`Successfully stored ${totalRolesAdded} roles for ${members.length} members in batch`);
-          resolve(totalRolesAdded);
-        }
-      });
-    });
+      if (filteredRoles.length === 0) {
+        console.log(`Member ${member.user.username} has no roles to store (besides @everyone)`);
+        continue;
+      }
+      
+      // Delete existing roles
+      deleteStmt.run(member.id);
+      
+      // Insert each role
+      for (const role of filteredRoles) {
+        insertStmt.run(
+          member.id,
+          role.id,
+          role.name,
+          role.hexColor,
+          role.position,
+          currentTime
+        );
+        totalRolesAdded++;
+      }
+    }
+    
+    // Finalize statements
+    deleteStmt.finalize();
+    insertStmt.finalize();
+    
+    // No commit or rollback here - rely on outer transaction management
+    
+    console.log(`Successfully stored ${totalRolesAdded} roles for ${members.length} members in batch`);
+    resolve(totalRolesAdded);
   });
 }
 
@@ -562,6 +552,10 @@ async function getProcessingCheckpoint(guildId) {
  * Memory-efficient guild member fetching for large Discord servers
  * Date: 2025-04-25
  */
+/**
+ * Memory-efficient guild member fetching for large Discord servers
+ * Date: 2025-04-25
+ */
 async function fetchMembersInChunks(guild, statusMessage) {
   // Initialize tracking variables
   let lastId = null;
@@ -621,6 +615,37 @@ async function fetchMembersInChunks(guild, statusMessage) {
   
   // Track processed members to avoid duplication
   const processedMemberIds = new Set();
+  
+  // Helper function to execute a database transaction
+  async function executeTransaction(operations) {
+    return new Promise((resolve, reject) => {
+      db.serialize(() => {
+        db.run('BEGIN TRANSACTION', (beginErr) => {
+          if (beginErr) {
+            return reject(beginErr);
+          }
+          
+          try {
+            // Execute the operations
+            const result = operations();
+            
+            // Commit the transaction
+            db.run('COMMIT', (commitErr) => {
+              if (commitErr) {
+                console.error('Error committing transaction:', commitErr);
+                db.run('ROLLBACK', () => reject(commitErr));
+              } else {
+                resolve(result);
+              }
+            });
+          } catch (operationErr) {
+            console.error('Error during transaction operations:', operationErr);
+            db.run('ROLLBACK', () => reject(operationErr));
+          }
+        });
+      });
+    });
+  }
   
   // Fetch members in chunks and process them immediately
   while (!done) {
@@ -699,14 +724,12 @@ async function fetchMembersInChunks(guild, statusMessage) {
       // Batch processing with immediate storage
       console.log(`[${new Date().toISOString()}] Processing ${response.length} members from chunk #${fetchCount}`);
       
-      // Start transaction
-      db.run('BEGIN TRANSACTION');
-      
-      // Process each member and store immediately
+      // Use the transaction helper for proper transaction management
       let processedInBatch = 0;
-      const currentTime = Date.now();
       
-      try {
+      await executeTransaction(() => {
+        const currentTime = Date.now();
+        
         for (const memberData of response) {
           // Skip if invalid data
           if (!memberData || !memberData.user || !memberData.user.id) {
@@ -803,18 +826,10 @@ async function fetchMembersInChunks(guild, statusMessage) {
           }
         }
         
-        // Commit transaction
-        db.run('COMMIT');
-        console.log(`[${new Date().toISOString()}] Successfully committed ${processedInBatch} members to database`);
-        
-      } catch (dbError) {
-        // Rollback transaction on error
-        console.error(`[${new Date().toISOString()}] Database error:`, dbError);
-        db.run('ROLLBACK');
-        
-        // Throw to outer catch
-        throw dbError;
-      }
+        return processedInBatch;
+      });
+      
+      console.log(`[${new Date().toISOString()}] Successfully committed ${processedInBatch} members to database`);
       
       // If we got fewer members than requested, we've reached the end
       if (response.length < 1000) {
@@ -879,9 +894,9 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
     db.run('PRAGMA cache_size = 10000');
     db.run('CREATE INDEX IF NOT EXISTS idx_member_roles_member_id ON member_roles(memberId)');
     
-	// Before your batch operations
-db.run('BEGIN TRANSACTION');
-	
+    // IMPORTANT: Remove this BEGIN TRANSACTION since transactions are managed within the methods
+    // db.run('BEGIN TRANSACTION');
+    
     // Update status message if provided
     if (statusMessage) {
       await statusMessage.edit(`Member Database Import Status\n` +
@@ -941,54 +956,77 @@ db.run('BEGIN TRANSACTION');
     const batchSize = config.getConfig('memberBatchSize', 'MEMBER_BATCH_SIZE') || 100;
     const concurrentBatchCount = config.getConfig('concurrentBatches', 'CONCURRENT_BATCHES') || 5;
     
-    // Process batches of members concurrently
-    for (let i = 0; i < members.length; i += (batchSize * concurrentBatchCount)) {
-      const batchPromises = [];
-      
-      for (let j = 0; j < concurrentBatchCount; j++) {
-        const startIndex = i + (j * batchSize);
-        if (startIndex >= members.length) break;
+    // START A TRANSACTION HERE FOR ALL BATCHES
+    db.run('BEGIN TRANSACTION');
+    let transactionActive = true;
+    
+    try {
+      // Process batches of members concurrently
+      for (let i = 0; i < members.length; i += (batchSize * concurrentBatchCount)) {
+        const batchPromises = [];
         
-        const endIndex = Math.min(startIndex + batchSize, members.length);
-        const currentBatch = members.slice(startIndex, endIndex);
+        for (let j = 0; j < concurrentBatchCount; j++) {
+          const startIndex = i + (j * batchSize);
+          if (startIndex >= members.length) break;
+          
+          const endIndex = Math.min(startIndex + batchSize, members.length);
+          const currentBatch = members.slice(startIndex, endIndex);
+          
+          if (currentBatch.length > 0) {
+            batchPromises.push(processMemberBatch(currentBatch));
+          }
+        }
         
-        if (currentBatch.length > 0) {
-          batchPromises.push(processMemberBatch(currentBatch));
+        if (batchPromises.length > 0) {
+          const batchResults = await Promise.all(batchPromises);
+          
+          // Sum up the results
+          for (const result of batchResults) {
+            memberCount += result.members;
+            roleCount += result.roles;
+          }
+          
+          // Update status message
+          if (statusMessage) {
+            await statusMessage.edit(`Member Database Import Status\n` +
+                                 `🔄 Processed ${memberCount}/${members.length} members with ${roleCount} roles...`);
+          }
         }
       }
       
-      if (batchPromises.length > 0) {
-        const batchResults = await Promise.all(batchPromises);
-        
-        // Sum up the results
-        for (const result of batchResults) {
-          memberCount += result.members;
-          roleCount += result.roles;
-        }
-        
-        // Update status message
-        if (statusMessage) {
-          await statusMessage.edit(`Member Database Import Status\n` +
-                               `🔄 Processed ${memberCount}/${members.length} members with ${roleCount} roles...`);
-        }
-      }
-    }
-    
-    // Final status update
-    console.log(`Completed storing ${memberCount} members with ${roleCount} roles for guild ${guild.name}`);
-    
-	  db.run('COMMIT');
-	
-    if (statusMessage) {
-      await statusMessage.edit(`Member Database Import Status\n` +
+      // COMMIT TRANSACTION AFTER ALL BATCHES
+      db.run('COMMIT');
+      transactionActive = false;
+      
+      // Final status update
+      console.log(`Completed storing ${memberCount} members with ${roleCount} roles for guild ${guild.name}`);
+      
+      if (statusMessage) {
+        await statusMessage.edit(`Member Database Import Status\n` +
                            `✅ Completed! Stored data for ${memberCount} members with ${roleCount} total roles`);
+      }
+      
+      return {
+        success: true,
+        memberCount,
+        roleCount
+      };
+    } catch (error) {
+      // ROLLBACK TRANSACTION ON ERROR
+      if (transactionActive) {
+        db.run('ROLLBACK');
+      }
+      
+      console.error(`Error in fetchAndStoreMembersForGuild:`, error);
+      if (statusMessage) {
+        await statusMessage.edit(`Member Database Import Status\n` +
+                           `❌ Error: ${error.message}`);
+      }
+      return {
+        success: false,
+        error: error.message
+      };
     }
-    
-    return {
-      success: true,
-      memberCount,
-      roleCount
-    };
   } catch (error) {
     console.error(`Error in fetchAndStoreMembersForGuild:`, error);
     if (statusMessage) {
@@ -1209,7 +1247,6 @@ function initializeMemberTracking(client) {
   });
 }
 
-// Export functions
 // Export functions
 module.exports = {
   initializeMemberTracking,
