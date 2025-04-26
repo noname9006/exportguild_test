@@ -96,8 +96,31 @@ async function initializeMemberDatabase(db) {
               return;
             }
             
-            console.log('Member tracking database tables initialized successfully');
-            resolve(true);
+            // Create processing_checkpoints table for efficient member fetching
+            db.run(`
+              CREATE TABLE IF NOT EXISTS processing_checkpoints (
+                guild_id TEXT PRIMARY KEY,
+                last_member_id TEXT,
+                timestamp INTEGER
+              )
+            `, (err) => {
+              if (err) {
+                console.error('Error creating processing_checkpoints table:', err);
+                reject(err);
+                return;
+              }
+              
+              // Create indexes for better performance
+              db.run(`CREATE INDEX IF NOT EXISTS idx_member_roles_member_id ON member_roles(memberId)`, (err) => {
+                if (err) {
+                  console.error('Error creating member_roles index:', err);
+                  // Non-fatal, continue
+                }
+                
+                console.log('Member tracking database tables initialized successfully');
+                resolve(true);
+              });
+            });
           });
         });
       });
@@ -223,6 +246,83 @@ async function storeMemberRolesInDb(member) {
         } else {
           console.log(`Stored ${successCount} roles for member ${member.user.username} (${member.id})`);
           resolve(successCount);
+        }
+      });
+    });
+  });
+}
+
+// Store multiple members' roles in a batch transaction
+async function storeMemberRolesInDbBatch(members) {
+  return new Promise((resolve, reject) => {
+    const db = monitor.getDatabase();
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
+    const currentTime = Date.now();
+    let totalRolesAdded = 0;
+    
+    // Start transaction
+    db.serialize(() => {
+      db.run('BEGIN TRANSACTION');
+      
+      // Prepare delete statement for reuse
+      const deleteStmt = db.prepare(`DELETE FROM member_roles WHERE memberId = ?`);
+      
+      // Prepare insert statement for reuse
+      const insertStmt = db.prepare(`
+        INSERT INTO member_roles (
+          memberId, roleId, roleName, roleColor, rolePosition, addedAt
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      
+      // Process each member
+      for (const member of members) {
+        if (!member || !member.roles || !member.roles.cache) {
+          console.log(`Skipping invalid member`);
+          continue;
+        }
+        
+        const roles = Array.from(member.roles.cache.values());
+        const filteredRoles = roles.filter(role => role.id !== member.guild.id);
+        
+        if (filteredRoles.length === 0) {
+          console.log(`Member ${member.user.username} has no roles to store (besides @everyone)`);
+          continue;
+        }
+        
+        // Delete existing roles
+        deleteStmt.run(member.id);
+        
+        // Insert each role
+        for (const role of filteredRoles) {
+          insertStmt.run(
+            member.id,
+            role.id,
+            role.name,
+            role.hexColor,
+            role.position,
+            currentTime
+          );
+          totalRolesAdded++;
+        }
+      }
+      
+      // Finalize statements
+      deleteStmt.finalize();
+      insertStmt.finalize();
+      
+      // Commit transaction
+      db.run('COMMIT', function(err) {
+        if (err) {
+          console.error('Error committing transaction:', err);
+          db.run('ROLLBACK');
+          reject(err);
+        } else {
+          console.log(`Successfully stored ${totalRolesAdded} roles for ${members.length} members in batch`);
+          resolve(totalRolesAdded);
         }
       });
     });
@@ -428,6 +528,342 @@ async function fetchAndStoreGuildRoles(guild) {
   }
 }
 
+// Store checkpoint for efficient member processing
+async function saveProcessingCheckpoint(guildId, lastProcessedMemberId) {
+  const db = monitor.getDatabase();
+  return new Promise((resolve, reject) => {
+    db.run(
+      'INSERT OR REPLACE INTO processing_checkpoints (guild_id, last_member_id, timestamp) VALUES (?, ?, ?)',
+      [guildId, lastProcessedMemberId, Date.now()],
+      function(err) {
+        if (err) reject(err);
+        else resolve(this.changes);
+      }
+    );
+  });
+}
+
+// Get last checkpoint for resuming member processing
+async function getProcessingCheckpoint(guildId) {
+  const db = monitor.getDatabase();
+  return new Promise((resolve, reject) => {
+    db.get(
+      'SELECT last_member_id FROM processing_checkpoints WHERE guild_id = ?',
+      [guildId],
+      (err, row) => {
+        if (err) reject(err);
+        else resolve(row ? row.last_member_id : null);
+      }
+    );
+  });
+}
+
+/**
+ * Memory-efficient guild member fetching for large Discord servers
+ * Date: 2025-04-25
+ */
+async function fetchMembersInChunks(guild, statusMessage) {
+  // Initialize tracking variables
+  let lastId = null;
+  let done = false;
+  let fetchCount = 0;
+  let totalFetched = 0;
+  
+  // Memory usage tracking
+  const initialMemory = process.memoryUsage().heapUsed;
+  const memoryThresholdMB = 1000; // 1GB threshold - adjust based on your environment
+  const memoryThresholdBytes = memoryThresholdMB * 1024 * 1024;
+  
+  // Initialize database connection once outside the loop
+  const db = monitor.getDatabase();
+  if (!db) {
+    throw new Error("Database not initialized");
+  }
+  
+  // Prepare statements for better performance
+  const memberStmt = db.prepare(`
+    INSERT OR REPLACE INTO guild_members (
+      id, username, displayName, avatarURL, joinedAt, joinedTimestamp, 
+      bot, lastUpdated, leftGuild
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  
+  const deleteRolesStmt = db.prepare(`
+    DELETE FROM member_roles WHERE memberId = ?
+  `);
+  
+  // Change to "INSERT OR IGNORE" to prevent unique constraint errors
+  const roleStmt = db.prepare(`
+    INSERT OR IGNORE INTO member_roles (
+      memberId, roleId, roleName, roleColor, rolePosition, addedAt
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  
+  console.log(`[${new Date().toISOString()}] Starting memory-efficient member fetch for guild ${guild.name} (${guild.id})`);
+  await statusMessage.edit(`Member Database Import Status\n` +
+    `🔄 Starting memory-efficient member fetch for ${guild.name}...`);
+  
+  // First fetch and store guild roles to ensure they're available for member role assignments
+  try {
+    await statusMessage.edit(`Member Database Import Status\n` +
+      `🔄 Fetching roles for ${guild.name}...`);
+    
+    const roleResult = await fetchAndStoreGuildRoles(guild);
+    await statusMessage.edit(`Member Database Import Status\n` +
+      `✅ Stored ${roleResult.roleCount} roles\n` +
+      `🔄 Now fetching members (this may take a while for large guilds)...`);
+  } catch (roleError) {
+    console.error(`[${new Date().toISOString()}] Error fetching roles:`, roleError);
+  }
+  
+  // Create a Map for role caching to avoid repeated object creation
+  const roleCache = new Map();
+  
+  // Track processed members to avoid duplication
+  const processedMemberIds = new Set();
+  
+  // Fetch members in chunks and process them immediately
+  while (!done) {
+    try {
+      // Check memory usage and perform garbage collection if available
+      const currentMemory = process.memoryUsage().heapUsed;
+      const memoryUsageMB = Math.round(currentMemory / 1024 / 1024);
+      
+      console.log(`[${new Date().toISOString()}] Memory usage: ${memoryUsageMB}MB`);
+      
+      if (currentMemory - initialMemory > memoryThresholdBytes) {
+        console.log(`[${new Date().toISOString()}] Memory threshold reached, forcing garbage collection`);
+        if (global.gc) {
+          global.gc();
+          await new Promise(resolve => setTimeout(resolve, 500)); // Give GC time to work
+        }
+      }
+      
+      // Build fetch options - using Discord's REST pagination
+      const options = { limit: 1000 }; // Max allowed by Discord API
+      if (lastId) options.after = lastId;
+      
+      fetchCount++;
+      console.log(`[${new Date().toISOString()}] Fetching member chunk #${fetchCount} (after ID: ${lastId || 'start'})`);
+      
+      // Update status message periodically
+      if (fetchCount % 5 === 0 || fetchCount === 1) {
+        await statusMessage.edit(`Member Database Import Status\n` +
+          `🔄 Fetched ${totalFetched} members so far...\n` +
+          `💾 Memory usage: ${memoryUsageMB}MB\n` +
+          `⏱️ Fetch operation #${fetchCount}`);
+      }
+      
+      // Use REST API directly for better pagination control
+      let response;
+      
+      try {
+        // Use Discord.js's REST client for proper rate limit handling
+        response = await guild.client.rest.get(
+          `/guilds/${guild.id}/members?limit=1000${lastId ? `&after=${lastId}` : ''}`
+        );
+      } catch (apiError) {
+        console.error(`[${new Date().toISOString()}] API Error:`, apiError);
+        
+        // Handle rate limiting explicitly
+        if (apiError.httpStatus === 429) {
+          const retryAfter = apiError.retryAfter || 5; // Default to 5 seconds if not specified
+          console.log(`[${new Date().toISOString()}] Rate limited, waiting ${retryAfter}s before retry`);
+          
+          await statusMessage.edit(`Member Database Import Status\n` +
+            `⏳ Rate limited by Discord. Waiting ${retryAfter}s before continuing...\n` +
+            `🔄 Fetched ${totalFetched} members so far`);
+          
+          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000 + 100));
+          continue; // Try again
+        }
+        
+        // For other errors, wait a bit and try again, but only up to 3 times
+        if (apiError.httpStatus >= 500 && fetchCount < 3) {
+          console.log(`[${new Date().toISOString()}] Server error, retrying in 5s...`);
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          continue;
+        }
+        
+        // If we get here, it's a serious error we can't recover from
+        throw apiError;
+      }
+      
+      // If no members returned, we're done
+      if (!response || response.length === 0) {
+        console.log(`[${new Date().toISOString()}] No more members returned, fetch complete`);
+        done = true;
+        continue;
+      }
+      
+      // Batch processing with immediate storage
+      console.log(`[${new Date().toISOString()}] Processing ${response.length} members from chunk #${fetchCount}`);
+      
+      // Start transaction
+      db.run('BEGIN TRANSACTION');
+      
+      // Process each member and store immediately
+      let processedInBatch = 0;
+      const currentTime = Date.now();
+      
+      try {
+        for (const memberData of response) {
+          // Skip if invalid data
+          if (!memberData || !memberData.user || !memberData.user.id) {
+            continue;
+          }
+          
+          // Extract just what we need to minimize memory usage
+          const user = memberData.user;
+          const memberId = user.id;
+          
+          // Skip if we've already processed this member
+          if (processedMemberIds.has(memberId)) {
+            console.log(`[${new Date().toISOString()}] Skipping already processed member: ${memberId}`);
+            continue;
+          }
+          
+          // Add to processed set
+          processedMemberIds.add(memberId);
+          
+          const joinedTimestamp = memberData.joined_at ? new Date(memberData.joined_at).getTime() : null;
+          const joinedAt = joinedTimestamp ? new Date(joinedTimestamp).toISOString() : null;
+          
+          // Store member data
+          memberStmt.run([
+            memberId,
+            user.username,
+            memberData.nick || user.username,
+            user.avatar ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png` : null,
+            joinedAt,
+            joinedTimestamp,
+            user.bot ? 1 : 0,
+            currentTime,
+            0 // Not left guild
+          ]);
+          
+          // Process roles - first delete existing
+          deleteRolesStmt.run(memberId);
+          
+          // Track roles we've inserted for this member to avoid duplicates
+          const insertedRoles = new Set();
+          
+          // Then add current roles
+          if (memberData.roles && Array.isArray(memberData.roles)) {
+            // Skip @everyone role which isn't included in the roles array from API
+            // Process each role
+            for (const roleId of memberData.roles) {
+              // Skip if we've already processed this role for this member
+              if (insertedRoles.has(roleId)) {
+                continue;
+              }
+              
+              // Get role data from cache if available
+              let role = roleCache.get(roleId);
+              
+              // If not in cache, get from guild
+              if (!role) {
+                const guildRole = guild.roles.cache.get(roleId);
+                if (guildRole) {
+                  // Minimize the data we store in memory
+                  role = {
+                    id: guildRole.id,
+                    name: guildRole.name,
+                    hexColor: guildRole.hexColor,
+                    position: guildRole.position
+                  };
+                  // Store in cache
+                  roleCache.set(roleId, role);
+                }
+              }
+              
+              // Insert role if we have data
+              if (role) {
+                roleStmt.run([
+                  memberId,
+                  role.id,
+                  role.name,
+                  role.hexColor,
+                  role.position,
+                  currentTime
+                ]);
+                
+                // Mark this role as inserted for this member
+                insertedRoles.add(roleId);
+              }
+            }
+          }
+          
+          processedInBatch++;
+          totalFetched++;
+          
+          // Update lastId to highest ID seen
+          if (!lastId || BigInt(memberId) > BigInt(lastId)) {
+            lastId = memberId;
+          }
+        }
+        
+        // Commit transaction
+        db.run('COMMIT');
+        console.log(`[${new Date().toISOString()}] Successfully committed ${processedInBatch} members to database`);
+        
+      } catch (dbError) {
+        // Rollback transaction on error
+        console.error(`[${new Date().toISOString()}] Database error:`, dbError);
+        db.run('ROLLBACK');
+        
+        // Throw to outer catch
+        throw dbError;
+      }
+      
+      // If we got fewer members than requested, we've reached the end
+      if (response.length < 1000) {
+        console.log(`[${new Date().toISOString()}] Reached end of member list (${response.length} < 1000)`);
+        done = true;
+      }
+      
+      // Add a small delay to prevent rate limits and allow GC to work
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
+    } catch (error) {
+      console.error(`[${new Date().toISOString()}] Error in member processing loop:`, error);
+      
+      // Update status message with error
+      await statusMessage.edit(`Member Database Import Status\n` +
+        `⚠️ Error encountered: ${error.message}\n` +
+        `🔄 Fetched ${totalFetched} members before error\n` +
+        `🔄 Attempting to continue...`);
+      
+      // If we've been fetching for a while, try to continue
+      if (fetchCount > 3) {
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      } else {
+        // If we're at the very beginning, this is fatal
+        done = true;
+        throw error;
+      }
+    }
+  }
+  
+  // Success, update status
+  console.log(`[${new Date().toISOString()}] Completed member fetch: ${totalFetched} members`);
+  await statusMessage.edit(`Member Database Import Status\n` +
+    `✅ Successfully fetched ${totalFetched} members from ${guild.name}\n` +
+    `💾 Final memory usage: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
+  
+  // Clean up prepared statements
+  memberStmt.finalize();
+  deleteRolesStmt.finalize();
+  roleStmt.finalize();
+  
+  // Return summary
+  return {
+    success: true,
+    memberCount: totalFetched,
+    fetchOperations: fetchCount
+  };
+}
+
 // Fetch all members for a guild and store them in database (for exportguild command)
 async function fetchAndStoreMembersForGuild(guild, statusMessage) {
   try {
@@ -437,10 +873,26 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
       return { success: false, error: "Database not initialized" };
     }
     
+    // Add database optimizations
+    db.run('PRAGMA journal_mode = WAL');
+    db.run('PRAGMA synchronous = NORMAL');
+    db.run('PRAGMA cache_size = 10000');
+    db.run('CREATE INDEX IF NOT EXISTS idx_member_roles_member_id ON member_roles(memberId)');
+    
     // Update status message if provided
     if (statusMessage) {
       await statusMessage.edit(`Member Database Import Status\n` +
                            `🔄 Fetching members for ${guild.name}...`);
+    }
+    
+    // Check if the guild is large and use the memory-efficient approach
+    const isLargeGuild = guild.memberCount > 10000; // Threshold for large guilds
+    
+    if (isLargeGuild) {
+      console.log(`Guild ${guild.name} has ${guild.memberCount} members - using memory-efficient processing`);
+      return await fetchMembersInChunks(guild, statusMessage);
+    } else {
+      console.log(`Guild ${guild.name} has ${guild.memberCount} members - using standard processing`);
     }
     
     // Fetch and store all roles first
@@ -452,13 +904,13 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
       if (roleResult.success) {
         console.log(`Successfully stored ${roleResult.roleCount} roles for guild ${guild.name}`);
         await statusMessage.edit(`Member Database Import Status\n` +
-                             `✅ Stored ${roleResult.roleCount} roles\n` +
-                             `🔄 Now fetching members...`);
+                              `✅ Stored ${roleResult.roleCount} roles\n` +
+                              `🔄 Now fetching members...`);
       } else {
         console.error('Error storing roles:', roleResult.error);
         await statusMessage.edit(`Member Database Import Status\n` +
-                             `⚠️ Error storing roles: ${roleResult.error}\n` +
-                             `🔄 Proceeding with member fetch...`);
+                              `⚠️ Error storing roles: ${roleResult.error}\n` +
+                              `🔄 Proceeding with member fetch...`);
       }
     } catch (roleError) {
       console.error('Error fetching roles:', roleError);
@@ -469,7 +921,6 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
     let memberCount = 0;
     let roleCount = 0;
     
-    // First ensure we have fetched all members for the guild
     try {
       await guild.members.fetch();
       console.log(`Fetched ${guild.members.cache.size} members from ${guild.name}`);
@@ -482,35 +933,40 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
       }
     }
     
-    // Process members in batches to avoid memory issues
+    // Process members in parallel batches
     const members = Array.from(guild.members.cache.values());
     const batchSize = config.getConfig('memberBatchSize', 'MEMBER_BATCH_SIZE') || 100;
-    let processedCount = 0;
+    const concurrentBatchCount = config.getConfig('concurrentBatches', 'CONCURRENT_BATCHES') || 5;
     
-    // Process in batches
-    for (let i = 0; i < members.length; i += batchSize) {
-      const batch = members.slice(i, i + batchSize);
+    // Process batches of members concurrently
+    for (let i = 0; i < members.length; i += (batchSize * concurrentBatchCount)) {
+      const batchPromises = [];
       
-      // Update status message for each batch
-      if (statusMessage && i % 500 === 0) {
-        await statusMessage.edit(`Member Database Import Status\n` +
-                             `🔄 Processing ${i}/${members.length} members...`);
+      for (let j = 0; j < concurrentBatchCount; j++) {
+        const startIndex = i + (j * batchSize);
+        if (startIndex >= members.length) break;
+        
+        const endIndex = Math.min(startIndex + batchSize, members.length);
+        const currentBatch = members.slice(startIndex, endIndex);
+        
+        if (currentBatch.length > 0) {
+          batchPromises.push(processMemberBatch(currentBatch));
+        }
       }
       
-      // Process each member in the batch
-      for (const member of batch) {
-        try {
-          // Store member data
-          await storeMemberInDb(member);
-          memberCount++;
-          
-          // Store member roles
-          const roleResult = await storeMemberRolesInDb(member);
-          roleCount += roleResult;
-          
-          processedCount++;
-        } catch (memberError) {
-          console.error(`Error storing member ${member.user.username}:`, memberError);
+      if (batchPromises.length > 0) {
+        const batchResults = await Promise.all(batchPromises);
+        
+        // Sum up the results
+        for (const result of batchResults) {
+          memberCount += result.members;
+          roleCount += result.roles;
+        }
+        
+        // Update status message
+        if (statusMessage) {
+          await statusMessage.edit(`Member Database Import Status\n` +
+                               `🔄 Processed ${memberCount}/${members.length} members with ${roleCount} roles...`);
         }
       }
     }
@@ -538,6 +994,46 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
       success: false,
       error: error.message
     };
+  }
+  
+  // Helper function to process a batch of members
+  async function processMemberBatch(memberBatch) {
+    let batchMemberCount = 0;
+    let batchRoleCount = 0;
+    
+    // Store all members first
+    const memberInsertPromises = memberBatch.map(member => storeMemberInDb(member));
+    await Promise.all(memberInsertPromises);
+    batchMemberCount += memberBatch.length;
+    
+    // Group members for batch role processing
+    const batchesOf50 = [];
+    for (let i = 0; i < memberBatch.length; i += 50) {
+      batchesOf50.push(memberBatch.slice(i, i + 50));
+    }
+    
+    // Process roles in smaller batches
+    for (const smallBatch of batchesOf50) {
+      try {
+        // Use the new batch processing function
+        const roleResult = await storeMemberRolesInDbBatch(smallBatch);
+        batchRoleCount += roleResult;
+      } catch (error) {
+        console.error('Error in batch role processing:', error);
+        
+        // Fallback to individual processing
+        for (const member of smallBatch) {
+          try {
+            const roleResult = await storeMemberRolesInDb(member);
+            batchRoleCount += roleResult;
+          } catch (memberError) {
+            console.error(`Error storing roles for member ${member.user.username}:`, memberError);
+          }
+        }
+      }
+    }
+    
+    return { members: batchMemberCount, roles: batchRoleCount };
   }
 }
 
@@ -709,12 +1205,15 @@ function initializeMemberTracking(client) {
 }
 
 // Export functions
+// Export functions
 module.exports = {
   initializeMemberTracking,
   initializeMemberDatabase,
   fetchAndStoreMembersForGuild,
+  fetchMembersInChunks,
   storeMemberInDb,
   storeMemberRolesInDb,
+  storeMemberRolesInDbBatch,
   addRoleHistoryEntry,
   markMemberLeftGuild,
   storeRoleInDb,
