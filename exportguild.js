@@ -959,15 +959,13 @@ async function updateStatusMessage(statusMessage, exportState, guild, isFinal = 
   
   if (isFinal) {
     status += `✅ Import completed! ${exportState.processedMessages.toLocaleString()} non-bot messages saved to database\n`;
-    status += `📝 Messages stored in database: ${exportState.messagesStoredInDb.toLocaleString()}\n`;
-    status += `🤖 Bot messages skipped: ${exportState.messageDroppedCount.toLocaleString()}\n`;
-    
+        
     if (exportState.dbErrors > 0) {
       status += `⚠️ Database errors encountered: ${exportState.dbErrors}\n`;
     }
     
     // Add database name
-    status += `💾 Database file: ${monitor.getCurrentDatabasePath()}\n`;
+    status += `💾 Database file: ${monitor.getCurrentDatabaseFilename()}\n`;
   } else if (exportState.activeChannels.size > 0) {
     // Get all active channel names
     const channelNames = Array.from(exportState.activeChannels.values());
@@ -977,13 +975,13 @@ async function updateStatusMessage(statusMessage, exportState, guild, isFinal = 
   }
   
   status += `📊 Processed ${exportState.processedMessages.toLocaleString()} non-bot messages from ${guild.name}\n`;
-  status += `⏱️ Time elapsed: ${hours}h ${minutes}m ${seconds}s\n`;
-  status += `⚡ Processing speed: ${currentSpeed} msg/sec (${avgMessagesPerSecond} average)\n`;
+    status += `⚡ Processing speed: ${currentSpeed} msg/sec (${avgMessagesPerSecond} average)\n`;
     status += `📈 Progress: ${exportState.processedChannels}/${exportState.totalChannels} channels (${Math.round(exportState.processedChannels / exportState.totalChannels * 100)}%)\n`;
   
   status += `🚦 Rate limit hits: ${exportState.rateLimitHits}\n`;
   // Add memory usage info
-  status += `💾 Memory: ${memory.rssMB}MB / ${MEMORY_LIMIT_MB}MB (${memory.percentOfLimit}%)\n`;
+
+  status += `⏱️ Time elapsed: ${hours}h ${minutes}m ${seconds}s\n`;
   status += `⏰ Last update: ${nowFormatted}`;
   
   try {

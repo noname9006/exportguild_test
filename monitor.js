@@ -276,6 +276,11 @@ function getCurrentDatabasePath() {
   return currentDbPath || path.join(process.cwd(), 'exportguild.db');
 }
 
+function getCurrentDatabaseFilename() {
+  const fullPath = getCurrentDatabasePath();
+  return path.basename(fullPath);
+}
+
 // Add message to cache with current timestamp
 function addMessageToCache(message) {
   const messageData = {
@@ -917,6 +922,7 @@ module.exports = {
   extractMessageMetadata,
   generateDbFilename,
   getCurrentDatabasePath,
+  getCurrentDatabaseFilename,
   getDatabase,
   fixExistingLastMessageIds
 };
