@@ -874,11 +874,14 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
     }
     
     // Add database optimizations
-    db.run('PRAGMA journal_mode = WAL');
+    db.run('PRAGMA journal_mode = TRUNCATE');
     db.run('PRAGMA synchronous = NORMAL');
     db.run('PRAGMA cache_size = 10000');
     db.run('CREATE INDEX IF NOT EXISTS idx_member_roles_member_id ON member_roles(memberId)');
     
+	// Before your batch operations
+db.run('BEGIN TRANSACTION');
+	
     // Update status message if provided
     if (statusMessage) {
       await statusMessage.edit(`Member Database Import Status\n` +
@@ -974,6 +977,8 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
     // Final status update
     console.log(`Completed storing ${memberCount} members with ${roleCount} roles for guild ${guild.name}`);
     
+	  db.run('COMMIT');
+	
     if (statusMessage) {
       await statusMessage.edit(`Member Database Import Status\n` +
                            `✅ Completed! Stored data for ${memberCount} members with ${roleCount} total roles`);
