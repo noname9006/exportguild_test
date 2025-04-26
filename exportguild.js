@@ -1121,8 +1121,10 @@ async function handleExportGuild(message, client) {
       console.error('Error storing final metadata:', metadataError);
     }
     
-    // Final status update
-    await updateStatusMessage(statusMessage, exportState, guild, true);
+// Clear timers before the final status update
+clearInterval(statusUpdateTimer);
+// Then do the final status update
+await updateStatusMessage(statusMessage, exportState, guild, true);
 	
 	// Fetch and store member data
 try {
