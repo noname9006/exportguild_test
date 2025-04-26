@@ -136,25 +136,34 @@ function initializeDatabase(guild = null) {
       // Create messages table
       db.run(`
         CREATE TABLE IF NOT EXISTS messages (
-          id TEXT PRIMARY KEY,
-          content TEXT,
-          authorId TEXT,
-          authorUsername TEXT,
-          authorBot INTEGER,
-          timestamp INTEGER,
-          createdAt TEXT,
-          channelId TEXT,
-          attachmentsJson TEXT,
-          embedsJson TEXT,
-          reactionsJson TEXT,
-          sticker_items TEXT
-        )
-      `, (err) => {
-        if (err) {
-          console.error('Error creating messages table:', err);
-          reject(err);
-          return;
-        }
+    id TEXT PRIMARY KEY,
+    content TEXT,
+    authorId TEXT,
+    authorUsername TEXT,
+    authorBot INTEGER,
+    timestamp INTEGER,
+    createdAt TEXT,
+    channelId TEXT,
+    attachmentsJson TEXT,
+    embedsJson TEXT,
+    reactionsJson TEXT,
+    sticker_items TEXT,
+    edited_timestamp TEXT,
+    tts INTEGER,
+    mention_everyone INTEGER,
+    mentions TEXT,
+    mention_roles TEXT,
+    mention_channels TEXT,
+    type INTEGER,
+    message_reference TEXT,
+    flags INTEGER
+  )
+`, (err) => {
+  if (err) {
+    console.error('Error creating messages table:', err);
+    reject(err);
+    return;
+  }
         
         // Create channels table to track which channels have been fetched
         // Removed fetchCompleted and lastFetchTimestamp fields
@@ -436,7 +445,29 @@ function extractMessageMetadata(message) {
     reactions: Array.from(message.reactions.cache.values()).map(reaction => ({
       emoji: reaction.emoji.name,
       count: reaction.count
-    }))
+    })),
+    // Include sticker_items
+    sticker_items: message.stickers ? JSON.stringify(Array.from(message.stickers.values()).map(sticker => ({
+      id: sticker.id,
+      name: sticker.name
+    }))) : null,
+    // New fields
+    edited_timestamp: message.editedTimestamp ? new Date(message.editedTimestamp).toISOString() : null,
+    tts: message.tts,
+    mention_everyone: message.mentions.everyone,
+    mentions: JSON.stringify(Array.from(message.mentions.users.values()).map(user => ({ 
+      id: user.id,
+      username: user.username 
+    }))),
+    mention_roles: JSON.stringify(Array.from(message.mentions.roles.values()).map(role => role.id)),
+    mention_channels: JSON.stringify(Array.from(message.mentions.channels.values()).map(channel => channel.id)),
+    type: message.type,
+    message_reference: message.reference ? JSON.stringify({
+      messageId: message.reference.messageId,
+      channelId: message.reference.channelId,
+      guildId: message.reference.guildId
+    }) : null,
+    flags: message.flags ? message.flags.bitfield : 0
   };
 }
 
@@ -459,8 +490,10 @@ async function storeMessageInDb(message) {
     // Insert message into database
     const sql = `
       INSERT OR REPLACE INTO messages 
-      (id, content, authorId, authorUsername, authorBot, timestamp, createdAt, channelId, attachmentsJson, embedsJson, reactionsJson) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, content, authorId, authorUsername, authorBot, timestamp, createdAt, channelId, 
+       attachmentsJson, embedsJson, reactionsJson, sticker_items, edited_timestamp, tts, mention_everyone, 
+       mentions, mention_roles, mention_channels, type, message_reference, flags) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
     
     db.run(sql, [
@@ -474,7 +507,17 @@ async function storeMessageInDb(message) {
       messageData.channelId,
       attachmentsJson,
       embedsJson,
-      reactionsJson
+      reactionsJson,
+      messageData.sticker_items,
+      messageData.edited_timestamp,
+      messageData.tts ? 1 : 0,
+      messageData.mention_everyone ? 1 : 0,
+      messageData.mentions,
+      messageData.mention_roles,
+      messageData.mention_channels,
+      messageData.type,
+      messageData.message_reference,
+      messageData.flags
     ], function(err) {
       if (err) {
         console.error('Error storing message in database:', err);
@@ -526,17 +569,29 @@ async function storeMessagesInDbBatch(messages) {
         messageData.channelId,
         attachmentsJson,
         embedsJson,
-        reactionsJson
+        reactionsJson,
+        message.sticker_items || null, // Include sticker_items
+        messageData.edited_timestamp,
+        messageData.tts ? 1 : 0,
+        messageData.mention_everyone ? 1 : 0,
+        messageData.mentions,
+        messageData.mention_roles,
+        messageData.mention_channels,
+        messageData.type,
+        messageData.message_reference,
+        messageData.flags
       );
       
-      // Add placeholder for this message
-      placeholders.push('(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      // Add placeholder for this message - now with 21 placeholders to include sticker_items
+      placeholders.push('(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     }
     
-    // Build the SQL statement for batch insert
+    // Build the SQL statement for batch insert - include sticker_items in the column list
     const sql = `
       INSERT OR REPLACE INTO messages 
-      (id, content, authorId, authorUsername, authorBot, timestamp, createdAt, channelId, attachmentsJson, embedsJson, reactionsJson) 
+      (id, content, authorId, authorUsername, authorBot, timestamp, createdAt, channelId, 
+       attachmentsJson, embedsJson, reactionsJson, sticker_items, edited_timestamp, tts, mention_everyone, 
+       mentions, mention_roles, mention_channels, type, message_reference, flags) 
       VALUES ${placeholders.join(', ')}
     `;
     

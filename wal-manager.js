@@ -22,30 +22,39 @@ async function initialize(discordClient, database) {
   // plus the processed flag
   await new Promise((resolve, reject) => {
     db.run(`
-      CREATE TABLE IF NOT EXISTS message_wal (
-          id TEXT PRIMARY KEY,
-          content TEXT,
-          authorId TEXT,
-          authorUsername TEXT,
-          authorBot INTEGER,
-          timestamp INTEGER,
-          createdAt TEXT,
-          channelId TEXT,
-          attachmentsJson TEXT,
-          embedsJson TEXT,
-          reactionsJson TEXT,
-          sticker_items TEXT,
-          processed INTEGER DEFAULT 0
-      )
-    `, (err) => {
-      if (err) {
-        console.error('Error creating WAL table:', err);
-        reject(err);
-      } else {
-        console.log('WAL table ready');
-        resolve();
-      }
-    });
+  CREATE TABLE IF NOT EXISTS message_wal (
+      id TEXT PRIMARY KEY,
+      content TEXT,
+      authorId TEXT,
+      authorUsername TEXT,
+      authorBot INTEGER,
+      timestamp INTEGER,
+      createdAt TEXT,
+      channelId TEXT,
+      attachmentsJson TEXT,
+      embedsJson TEXT,
+      reactionsJson TEXT,
+      sticker_items TEXT,
+      edited_timestamp TEXT,
+      tts INTEGER,
+      mention_everyone INTEGER,
+      mentions TEXT,
+      mention_roles TEXT,
+      mention_channels TEXT,
+      type INTEGER,
+      message_reference TEXT,
+      flags INTEGER,
+      processed INTEGER DEFAULT 0
+  )
+`, (err) => {
+  if (err) {
+    console.error('Error creating WAL table:', err);
+    reject(err);
+  } else {
+    console.log('WAL table ready');
+    resolve();
+  }
+});
   });
   
   // Start periodic checking of WAL entries
@@ -107,8 +116,11 @@ async function addMessage(message) {
         INSERT OR IGNORE INTO message_wal (
           id, content, authorId, authorUsername, authorBot, 
           timestamp, createdAt, channelId, 
-          attachmentsJson, embedsJson, reactionsJson, processed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          attachmentsJson, embedsJson, reactionsJson, sticker_items, 
+          edited_timestamp, tts, mention_everyone, 
+          mentions, mention_roles, mention_channels, 
+          type, message_reference, flags, processed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         messageData.id, 
         messageData.content, 
@@ -121,6 +133,16 @@ async function addMessage(message) {
         attachmentsJson,
         embedsJson,
         reactionsJson,
+        messageData.sticker_items,
+        messageData.edited_timestamp,
+        messageData.tts ? 1 : 0,
+        messageData.mention_everyone ? 1 : 0,
+        messageData.mentions,
+        messageData.mention_roles,
+        messageData.mention_channels,
+        messageData.type,
+        messageData.message_reference,
+        messageData.flags,
         0 // processed flag initially set to 0
       ], function(err) {
         if (err) {
@@ -228,34 +250,46 @@ async function checkWalEntries() {
         if (messageExists) {
           // Insert into messages table
           await new Promise((resolve, reject) => {
-            db.run(`
-              INSERT INTO messages (
-                id, content, authorId, authorUsername, authorBot,
-                timestamp, createdAt, channelId,
-                attachmentsJson, embedsJson, reactionsJson, sticker_items
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [
-              entry.id, 
-              entry.content, 
-              entry.authorId, 
-              entry.authorUsername, 
-              entry.authorBot,
-              entry.timestamp, 
-              entry.createdAt, 
-              entry.channelId,
-              entry.attachmentsJson, 
-              entry.embedsJson, 
-              entry.reactionsJson,
-              entry.sticker_items
-            ], function(err) {
-              if (err) {
-                console.error(`Error inserting message ${entry.id} from WAL to main table:`, err);
-                reject(err);
-              } else {
-                console.log(`Successfully moved message ${entry.id} from WAL to main table`);
-                resolve(this.lastID);
-              }
-            });
+db.run(`
+  INSERT INTO messages (
+    id, content, authorId, authorUsername, authorBot,
+    timestamp, createdAt, channelId,
+    attachmentsJson, embedsJson, reactionsJson, sticker_items,
+    edited_timestamp, tts, mention_everyone, 
+    mentions, mention_roles, mention_channels, 
+    type, message_reference, flags
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, [
+  entry.id, 
+  entry.content, 
+  entry.authorId, 
+  entry.authorUsername, 
+  entry.authorBot,
+  entry.timestamp, 
+  entry.createdAt, 
+  entry.channelId,
+  entry.attachmentsJson, 
+  entry.embedsJson, 
+  entry.reactionsJson,
+  entry.sticker_items,
+  entry.edited_timestamp,
+  entry.tts,
+  entry.mention_everyone,
+  entry.mentions,
+  entry.mention_roles,
+  entry.mention_channels,
+  entry.type,
+  entry.message_reference,
+  entry.flags
+], function(err) {
+  if (err) {
+    console.error(`Error inserting message ${entry.id} from WAL to main table:`, err);
+    reject(err);
+  } else {
+    console.log(`Successfully moved message ${entry.id} from WAL to main table`);
+    resolve(this.lastID);
+  }
+});
           });
         } else {
           console.log(`Message ${entry.id} no longer exists, skipping database insertion`);
