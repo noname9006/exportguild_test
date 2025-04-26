@@ -552,10 +552,6 @@ async function getProcessingCheckpoint(guildId) {
  * Memory-efficient guild member fetching for large Discord servers
  * Date: 2025-04-25
  */
-/**
- * Memory-efficient guild member fetching for large Discord servers
- * Date: 2025-04-25
- */
 async function fetchMembersInChunks(guild, statusMessage) {
   // Initialize tracking variables
   let lastId = null;
@@ -573,6 +569,13 @@ async function fetchMembersInChunks(guild, statusMessage) {
   if (!db) {
     throw new Error("Database not initialized");
   }
+  
+  // Enable WAL mode temporarily for this bulk operation
+  console.log(`[${new Date().toISOString()}] Enabling WAL mode for bulk member fetch operation`);
+  db.run('PRAGMA journal_mode = WAL');
+  db.run('PRAGMA synchronous = NORMAL');
+  db.run('PRAGMA cache_size = 10000');
+  db.run('PRAGMA temp_store = MEMORY');
   
   // Prepare statements for better performance
   const memberStmt = db.prepare(`
@@ -871,6 +874,35 @@ async function fetchMembersInChunks(guild, statusMessage) {
   deleteRolesStmt.finalize();
   roleStmt.finalize();
   
+  // Perform a full checkpoint and then switch back to DELETE mode
+  console.log(`[${new Date().toISOString()}] Performing WAL checkpoint and reverting to DELETE journal mode...`);
+  
+  // First checkpoint to ensure all changes are in the main DB
+  await new Promise((resolve, reject) => {
+    db.run('PRAGMA wal_checkpoint(FULL)', function(err) {
+      if (err) {
+        console.error(`[${new Date().toISOString()}] Error during WAL checkpoint:`, err);
+        reject(err);
+      } else {
+        console.log(`[${new Date().toISOString()}] WAL checkpoint completed successfully.`);
+        resolve();
+      }
+    });
+  });
+  
+  // Then switch back to DELETE mode which will remove the WAL file
+  await new Promise((resolve, reject) => {
+    db.run('PRAGMA journal_mode = DELETE', function(err) {
+      if (err) {
+        console.error(`[${new Date().toISOString()}] Error switching journal mode:`, err);
+        reject(err);
+      } else {
+        console.log(`[${new Date().toISOString()}] Successfully switched to DELETE journal mode.`);
+        resolve();
+      }
+    });
+  });
+  
   // Return summary
   return {
     success: true,
@@ -888,14 +920,13 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
       return { success: false, error: "Database not initialized" };
     }
     
-    // Add database optimizations
-    db.run('PRAGMA journal_mode = TRUNCATE');
+    // Enable WAL mode temporarily for this bulk operation
+    console.log(`[${new Date().toISOString()}] Enabling WAL mode for bulk member fetch operation`);
+    db.run('PRAGMA journal_mode = WAL');
     db.run('PRAGMA synchronous = NORMAL');
     db.run('PRAGMA cache_size = 10000');
+    db.run('PRAGMA temp_store = MEMORY');
     db.run('CREATE INDEX IF NOT EXISTS idx_member_roles_member_id ON member_roles(memberId)');
-    
-    // IMPORTANT: Remove this BEGIN TRANSACTION since transactions are managed within the methods
-    // db.run('BEGIN TRANSACTION');
     
     // Update status message if provided
     if (statusMessage) {
@@ -1006,6 +1037,35 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
                            `✅ Completed! Stored data for ${memberCount} members with ${roleCount} total roles`);
       }
       
+      // Perform a full checkpoint and then switch back to DELETE mode
+      console.log(`Performing WAL checkpoint and reverting to DELETE journal mode...`);
+      
+      // First checkpoint to ensure all changes are in the main DB
+      await new Promise((resolve, reject) => {
+        db.run('PRAGMA wal_checkpoint(FULL)', function(err) {
+          if (err) {
+            console.error(`Error during WAL checkpoint:`, err);
+            reject(err);
+          } else {
+            console.log(`WAL checkpoint completed successfully.`);
+            resolve();
+          }
+        });
+      });
+      
+      // Then switch back to DELETE mode which will remove the WAL file
+      await new Promise((resolve, reject) => {
+        db.run('PRAGMA journal_mode = DELETE', function(err) {
+          if (err) {
+            console.error(`Error switching journal mode:`, err);
+            reject(err);
+          } else {
+            console.log(`Successfully switched to DELETE journal mode.`);
+            resolve();
+          }
+        });
+      });
+      
       return {
         success: true,
         memberCount,
@@ -1078,6 +1138,41 @@ async function fetchAndStoreMembersForGuild(guild, statusMessage) {
     
     return { members: batchMemberCount, roles: batchRoleCount };
   }
+}
+
+/**
+ * Cleans up WAL files by checkpointing and switching journal mode
+ * Can be called anytime WAL files need to be removed
+ */
+async function cleanupWalFiles() {
+  return new Promise((resolve, reject) => {
+    const db = monitor.getDatabase();
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
+    console.log(`[${new Date().toISOString()}] Cleaning up WAL files...`);
+    
+    // First checkpoint
+    db.run('PRAGMA wal_checkpoint(FULL)', function(checkpointErr) {
+      if (checkpointErr) {
+        console.error(`[${new Date().toISOString()}] Error during checkpoint:`, checkpointErr);
+      }
+      
+      // Switch to DELETE mode to remove the WAL file
+      db.run('PRAGMA journal_mode = DELETE', function(modeErr) {
+        if (modeErr) {
+          console.error(`[${new Date().toISOString()}] Error switching journal mode:`, modeErr);
+          reject(modeErr);
+          return;
+        }
+        
+        console.log(`[${new Date().toISOString()}] Successfully removed WAL files`);
+        resolve(true);
+      });
+    });
+  });
 }
 
 // Get formatted date time for logs
@@ -1260,5 +1355,6 @@ module.exports = {
   markMemberLeftGuild,
   storeRoleInDb,
   markRoleDeleted,
-  fetchAndStoreGuildRoles
+  fetchAndStoreGuildRoles,
+  cleanupWalFiles
 };
