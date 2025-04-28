@@ -1136,43 +1136,25 @@ try {
   
   const memberResult = await memberTracker.fetchAndStoreMembersForGuild(guild, memberStatusMessage);
   
-if (memberResult.success) {
+  if (memberResult.success) {
   console.log(`Successfully stored member data: ${memberResult.memberCount} members with ${memberResult.roleCount || 0} roles`);
   
-  // Store metadata about member export - Add null checks
-  await monitor.storeGuildMetadata('members_exported', memberResult.memberCount.toString());
+  // Store metadata about member export
+  await monitor.storeGuildMetadata('members_exported', memberResult.memberCount ? memberResult.memberCount.toString() : '0');
   
   // Fix for roleCount being undefined
   const roleCount = memberResult.roleCount !== undefined ? memberResult.roleCount.toString() : '0';
   await monitor.storeGuildMetadata('member_roles_exported', roleCount);
   
   await monitor.storeGuildMetadata('member_export_completed_at', new Date().toISOString());
-  
-  // Now proceed with left members processing
-  console.log('Processing members who have left the guild...');
-  try {
-    const leftMembersResult = await memberLeft.processLeftMembers(guild);
-    if (leftMembersResult.success) {
-      console.log(`Successfully processed left members: ${leftMembersResult.addedCount} former members added to database`);
-      await monitor.storeGuildMetadata('left_members_processed', leftMembersResult.addedCount.toString());
-      await monitor.storeGuildMetadata('left_members_processed_at', new Date().toISOString());
-    } else {
-      console.error('Error during left member processing:', leftMembersResult.error);
-      await monitor.storeGuildMetadata('left_member_processing_error', leftMembersResult.error);
-    }
-  } catch (leftMemberError) {
-    console.error('Error during left member processing:', leftMemberError);
-    await monitor.storeGuildMetadata('left_member_processing_error', leftMemberError.message);
-  }
-} else {
-  console.error('Error during member export:', memberResult.error);
-  await monitor.storeGuildMetadata('member_export_error', memberResult.error);
 }
   
-  // ADD THE NEW CODE HERE - Process left members after regular member processing
+  // Process left members after regular member processing
   console.log('Processing members who have left the guild...');
   try {
-    const leftMembersResult = await memberLeft.processLeftMembers(guild);
+	  
+const leftMembersResult = await memberLeft.processLeftMembers(guild, 200, true);
+
     if (leftMembersResult.success) {
       console.log(`Successfully processed left members: ${leftMembersResult.addedCount} former members added to database`);
       await monitor.storeGuildMetadata('left_members_processed', leftMembersResult.addedCount.toString());
