@@ -7,10 +7,7 @@ const monitor = require('./monitor');
  * @param {Object} guild - The Discord guild object
  */
 async function processLeftMembers(guild) {
-    console.log(`========================================`);
-    console.log(`[${getFormattedDateTime()}] START: Processing left members for guild ${guild.name} (${guild.id})`);
-    console.log(`[${getFormattedDateTime()}] Database connection available: ${monitor.getDatabase() !== null}`);
-    console.log(`========================================`);
+    console.log(`[${getFormattedDateTime()}] Processing left members for guild ${guild.name} (${guild.id})`);
     
     const db = monitor.getDatabase();
     if (!db) {
@@ -19,136 +16,75 @@ async function processLeftMembers(guild) {
     }
 
     try {
-        console.log(`[${getFormattedDateTime()}] Finding missing members - this may take some time...`);
-        
-        // Use a single SQL query to get all missing members with their message timestamps
-        const missingMembers = await findMissingMembersWithTimestamps(db);
+        // Get all message authors from the database who aren't in guild_members
+        const missingMembers = await findMissingMembers(db);
         console.log(`[${getFormattedDateTime()}] Found ${missingMembers.length} users in messages who might have left the guild`);
-        
-        // Log first few members for debugging
-        if (missingMembers.length > 0) {
-            console.log(`[${getFormattedDateTime()}] Sample of missing members:`);
-            for (let i = 0; i < Math.min(5, missingMembers.length); i++) {
-                const member = missingMembers[i];
-                console.log(`   - ${member.authorUsername} (${member.authorId}): First msg: ${new Date(member.firstMessageTime).toISOString()}, Last msg: ${new Date(member.lastMessageTime).toISOString()}`);
+
+        let addedCount = 0;
+
+        // Process each missing member
+        for (const member of missingMembers) {
+            try {
+                // Check if the user is actually in the guild (just to be safe)
+                let guildMember = null;
+                try {
+                    guildMember = await guild.members.fetch(member.authorId);
+                } catch (fetchError) {
+                    // If we can't fetch the member, they're likely not in the guild anymore
+                    // This is expected for left members
+                }
+
+                // If the member is not in the guild, add them to the guild_members table as left
+                if (!guildMember) {
+                    // Get their first and last message timestamps for join/leave estimates
+                    const memberTimestamps = await getMemberMessageTimestamps(db, member.authorId);
+                    
+                    if (!memberTimestamps) {
+                        console.log(`[${getFormattedDateTime()}] Could not determine timestamps for ${member.authorUsername} (${member.authorId}), skipping`);
+                        continue;
+                    }
+
+                    // Add member to guild_members table
+                    const currentTime = Date.now();
+                    await addLeftMemberToDb(
+                        db, 
+                        member.authorId, 
+                        member.authorUsername, 
+                        memberTimestamps.firstMessageTime, // Use first message as joinedTimestamp estimate
+                        memberTimestamps.lastMessageTime,  // Use last message as leftTimestamp estimate
+                        currentTime
+                    );
+
+                    // Add their roles to member_roles database table if we find any in messages
+                    await addMemberRolesFromMessages(db, member.authorId);
+                    
+                    addedCount++;
+                }
+            } catch (memberError) {
+                console.error(`[${getFormattedDateTime()}] Error processing member ${member.authorUsername} (${member.authorId}):`, memberError);
             }
         }
 
-        // Batch process members instead of one by one
-        const BATCH_SIZE = 100; // Process 100 members at a time
-        let addedCount = 0;
-        let processedCount = 0;
-        let skippedCount = 0;
-        let roleCount = 0;
-        
-        // Use a transaction for better performance
-        console.log(`[${getFormattedDateTime()}] Starting database transaction for bulk processing...`);
-        await executeTransaction(db, async () => {
-            // Process members in batches
-            for (let i = 0; i < missingMembers.length; i += BATCH_SIZE) {
-                const batch = missingMembers.slice(i, i + BATCH_SIZE);
-                const batchNum = Math.floor(i/BATCH_SIZE) + 1;
-                const totalBatches = Math.ceil(missingMembers.length/BATCH_SIZE);
-                console.log(`[${getFormattedDateTime()}] Processing batch ${batchNum}/${totalBatches} (${batch.length} members)`);
-                
-                // Process batch in parallel
-                const results = await Promise.all(batch.map(async (member) => {
-                    try {
-                        processedCount++;
-                        // Check if the user is actually in the guild
-                        let guildMember = null;
-                        try {
-                            guildMember = await guild.members.fetch(member.authorId);
-                        } catch (fetchError) {
-                            // Expected for left members - this is normal
-                        }
-                        
-                        // Skip if member is actually in the guild
-                        if (guildMember) {
-                            console.log(`[${getFormattedDateTime()}] User ${member.authorUsername} (${member.authorId}) is still in guild, skipping`);
-                            skippedCount++;
-                            return null;
-                        }
-                        
-                        const currentTime = Date.now();
-                        
-                        // Add to guild_members
-                        await addLeftMemberToDb(
-                            db, 
-                            member.authorId, 
-                            member.authorUsername, 
-                            member.firstMessageTime, 
-                            member.lastMessageTime,
-                            currentTime
-                        );
-                        
-                        return member;
-                    } catch (error) {
-                        console.error(`[${getFormattedDateTime()}] Error processing member ${member.authorUsername} (${member.authorId}):`, error);
-                        return null;
-                    }
-                }));
-                
-                // Count successfully added members
-                const addedMembers = results.filter(m => m !== null);
-                addedCount += addedMembers.length;
-                
-                // Process roles in bulk after adding members
-                if (addedMembers.length > 0) {
-                    const batchRoleCount = await addBulkMemberRoles(db, addedMembers.map(m => m.authorId));
-                    roleCount += batchRoleCount;
-                }
-                
-                // Log progress
-                console.log(`[${getFormattedDateTime()}] Batch ${batchNum}/${totalBatches} complete: Added ${addedMembers.length} members in this batch`);
-                console.log(`[${getFormattedDateTime()}] Progress: ${processedCount}/${missingMembers.length} (${Math.round(processedCount/missingMembers.length*100)}%) processed, ${addedCount} added, ${skippedCount} skipped`);
-            }
-        });
-        
-        console.log(`========================================`);
-        console.log(`[${getFormattedDateTime()}] LEFT MEMBER PROCESSING SUMMARY:`);
-        console.log(`[${getFormattedDateTime()}] - Total processed: ${processedCount}`);
-        console.log(`[${getFormattedDateTime()}] - Added to database: ${addedCount}`);
-        console.log(`[${getFormattedDateTime()}] - Skipped (still in guild): ${skippedCount}`);
-        console.log(`[${getFormattedDateTime()}] - Roles recovered: ${roleCount}`);
-        console.log(`========================================`);
-        
-        return { 
-            success: true, 
-            addedCount,
-            processedCount,
-            skippedCount,
-            roleCount
-        };
+        console.log(`[${getFormattedDateTime()}] Added ${addedCount} left members to the database`);
+        return { success: true, addedCount };
     } catch (error) {
-        console.error(`[${getFormattedDateTime()}] ERROR: Failed to process left members:`, error);
-        console.error(`[${getFormattedDateTime()}] Stack trace:`, error.stack);
+        console.error(`[${getFormattedDateTime()}] Error processing left members:`, error);
         return { success: false, error: error.message };
     }
 }
 
 /**
- * Finds message authors who aren't in the guild_members table and also gets their message timestamps
+ * Finds message authors who aren't in the guild_members table
  * @param {Object} db - Database connection
- * @returns {Array} Array of member objects with authorId, authorUsername, firstMessageTime, and lastMessageTime
+ * @returns {Array} Array of member objects with authorId and authorUsername
  */
-function findMissingMembersWithTimestamps(db) {
+function findMissingMembers(db) {
     return new Promise((resolve, reject) => {
-        console.log(`[${getFormattedDateTime()}] Executing SQL to find missing members...`);
-        
-        // Single optimized query to get members and their message timestamps
         const sql = `
-            SELECT 
-                m.authorId, 
-                m.authorUsername,
-                MIN(m.timestamp) as firstMessageTime,
-                MAX(m.timestamp) as lastMessageTime,
-                COUNT(m.id) as messageCount
-            FROM messages m
-            LEFT JOIN guild_members gm ON m.authorId = gm.id
-            WHERE m.authorBot = 0 AND gm.id IS NULL
-            GROUP BY m.authorId, m.authorUsername
-            ORDER BY messageCount DESC
+            SELECT DISTINCT authorId, authorUsername, authorBot
+            FROM messages
+            WHERE authorBot = 0
+            AND authorId NOT IN (SELECT id FROM guild_members)
         `;
 
         db.all(sql, [], (err, rows) => {
@@ -158,59 +94,40 @@ function findMissingMembersWithTimestamps(db) {
                 return;
             }
             
-            console.log(`[${getFormattedDateTime()}] Found ${rows.length} missing members from message history`);
             resolve(rows);
         });
     });
 }
 
 /**
- * Execute a database transaction
+ * Gets the first and last message timestamps for a member
  * @param {Object} db - Database connection
- * @param {Function} operations - Function containing the operations to perform
- * @returns {Promise} Promise that resolves when the transaction completes
+ * @param {String} memberId - Member ID
+ * @returns {Object} Object with firstMessageTime and lastMessageTime
  */
-function executeTransaction(db, operations) {
+function getMemberMessageTimestamps(db, memberId) {
     return new Promise((resolve, reject) => {
-        db.serialize(() => {
-            db.run('BEGIN TRANSACTION', (beginErr) => {
-                if (beginErr) {
-                    console.error(`[${getFormattedDateTime()}] Error beginning transaction:`, beginErr);
-                    return reject(beginErr);
-                }
-                
-                console.log(`[${getFormattedDateTime()}] Transaction started successfully`);
-                
-                try {
-                    // Execute the operations
-                    operations()
-                        .then(() => {
-                            // Commit the transaction
-                            console.log(`[${getFormattedDateTime()}] Operations complete, committing transaction...`);
-                            db.run('COMMIT', (commitErr) => {
-                                if (commitErr) {
-                                    console.error(`[${getFormattedDateTime()}] Error committing transaction:`, commitErr);
-                                    db.run('ROLLBACK', () => reject(commitErr));
-                                } else {
-                                    console.log(`[${getFormattedDateTime()}] Transaction committed successfully`);
-                                    resolve();
-                                }
-                            });
-                        })
-                        .catch(operationErr => {
-                            console.error(`[${getFormattedDateTime()}] Error during transaction operations:`, operationErr);
-                            db.run('ROLLBACK', () => {
-                                console.log(`[${getFormattedDateTime()}] Transaction rolled back due to error`);
-                                reject(operationErr);
-                            });
-                        });
-                } catch (operationErr) {
-                    console.error(`[${getFormattedDateTime()}] Unexpected error during transaction:`, operationErr);
-                    db.run('ROLLBACK', () => {
-                        console.log(`[${getFormattedDateTime()}] Transaction rolled back due to unexpected error`);
-                        reject(operationErr);
-                    });
-                }
+        const sql = `
+            SELECT MIN(timestamp) as firstMessageTime, MAX(timestamp) as lastMessageTime
+            FROM messages
+            WHERE authorId = ?
+        `;
+
+        db.get(sql, [memberId], (err, row) => {
+            if (err) {
+                console.error(`[${getFormattedDateTime()}] Error getting message timestamps for ${memberId}:`, err);
+                reject(err);
+                return;
+            }
+            
+            if (!row || !row.firstMessageTime || !row.lastMessageTime) {
+                resolve(null);
+                return;
+            }
+            
+            resolve({
+                firstMessageTime: row.firstMessageTime,
+                lastMessageTime: row.lastMessageTime
             });
         });
     });
@@ -229,9 +146,6 @@ function executeTransaction(db, operations) {
 function addLeftMemberToDb(db, memberId, username, joinedTimestamp, leftTimestamp, lastUpdated) {
     return new Promise((resolve, reject) => {
         const joinedAt = joinedTimestamp ? new Date(joinedTimestamp).toISOString() : null;
-        const leftAt = leftTimestamp ? new Date(leftTimestamp).toISOString() : null;
-        
-        console.log(`[${getFormattedDateTime()}] Adding left member ${username} (${memberId}) with join: ${joinedAt}, left: ${leftAt}`);
         
         const sql = `
             INSERT OR REPLACE INTO guild_members (
@@ -258,163 +172,153 @@ function addLeftMemberToDb(db, memberId, username, joinedTimestamp, leftTimestam
                 return;
             }
             
-            console.log(`[${getFormattedDateTime()}] Successfully added left member ${username} (${memberId}) to database`);
+            console.log(`[${getFormattedDateTime()}] Added left member ${username} (${memberId}) to database (estimated join: ${joinedAt}, left: ${new Date(leftTimestamp).toISOString()})`);
             resolve(this.changes);
         });
     });
 }
 
 /**
- * Process roles for multiple members in bulk
+ * Tries to find roles from message mentions to add to member_roles table
+ * This is an estimate since we can only find roles that were mentioned
  * @param {Object} db - Database connection
- * @param {Array} memberIds - Array of member IDs
- * @returns {Promise} Promise that resolves when roles are processed
+ * @param {String} memberId - Member ID
+ * @returns {Promise} Promise that resolves when roles are added
  */
-async function addBulkMemberRoles(db, memberIds) {
-    if (!memberIds || memberIds.length === 0) return 0;
-    
+async function addMemberRolesFromMessages(db, memberId) {
     try {
-        console.log(`[${getFormattedDateTime()}] Bulk processing roles for ${memberIds.length} members`);
+        // Find messages that mention the member
+        const messages = await findMemberMentions(db, memberId);
+        
+        // Set to track roles we've already added
+        const addedRoleIds = new Set();
         const currentTime = Date.now();
         let roleCount = 0;
         
-        // Create a prepared statement for better performance
-        const stmt = db.prepare(`
-            INSERT OR IGNORE INTO member_roles (
-                memberId, roleId, roleName, roleColor, rolePosition, addedAt
-            ) VALUES (?, ?, ?, ?, ?, ?)
-        `);
-        
-        // Process each member
-        for (const memberId of memberIds) {
-            // Find roles from mentions for this member
-            const roles = await findRolesForMember(db, memberId);
-            
-            if (roles.length > 0) {
-                console.log(`[${getFormattedDateTime()}] Found ${roles.length} roles for member ${memberId}`);
-            }
-            
-            // Add each role
-            for (const role of roles) {
-                try {
-                    stmt.run(
-                        memberId,
-                        role.id,
-                        role.name,
-                        role.color,
-                        role.position,
-                        currentTime
-                    );
-                    roleCount++;
-                } catch (error) {
-                    console.error(`[${getFormattedDateTime()}] Error adding role ${role.name} for member ${memberId}:`, error);
+        // Extract roles from mentions
+        for (const message of messages) {
+            try {
+                // Try to parse mention_roles JSON data
+                if (message.mention_roles) {
+                    const roles = JSON.parse(message.mention_roles);
+                    
+                    // For each role mentioned
+                    for (const roleId of roles) {
+                        // Skip if we've already added this role
+                        if (addedRoleIds.has(roleId)) continue;
+                        
+                        // Get role details
+                        const role = await getRoleDetails(db, roleId);
+                        if (!role) continue;
+                        
+                        // Add to member_roles table
+                        await addRoleToMember(db, memberId, role, currentTime);
+                        addedRoleIds.add(roleId);
+                        roleCount++;
+                    }
                 }
+            } catch (parseError) {
+                console.error(`[${getFormattedDateTime()}] Error parsing role mentions for ${memberId}:`, parseError);
             }
         }
         
-        // Finalize the statement
-        stmt.finalize();
-        
-        console.log(`[${getFormattedDateTime()}] Added ${roleCount} roles for ${memberIds.length} members`);
+        console.log(`[${getFormattedDateTime()}] Added ${roleCount} roles for left member ${memberId} from message mentions`);
         return roleCount;
     } catch (error) {
-        console.error(`[${getFormattedDateTime()}] Error adding bulk roles:`, error);
+        console.error(`[${getFormattedDateTime()}] Error adding roles from messages for ${memberId}:`, error);
         return 0;
     }
 }
 
 /**
- * Find roles for a member from message mentions and role tables
+ * Finds messages that mention a specific member
  * @param {Object} db - Database connection
  * @param {String} memberId - Member ID
- * @returns {Promise<Array>} Promise resolving to an array of roles
+ * @returns {Promise<Array>} Promise that resolves with an array of messages
  */
-async function findRolesForMember(db, memberId) {
+function findMemberMentions(db, memberId) {
     return new Promise((resolve, reject) => {
-        // First try the optimized query that joins message mentions with guild_roles table
         const sql = `
-            WITH member_mentions AS (
-                SELECT m.mention_roles
-                FROM messages m
-                WHERE m.mentions LIKE ? AND m.mention_roles IS NOT NULL
-                LIMIT 100
-            )
-            SELECT DISTINCT gr.id, gr.name, gr.color, gr.position
-            FROM guild_roles gr
-            JOIN member_mentions mm ON mm.mention_roles LIKE '%' || gr.id || '%'
+            SELECT mentions, mention_roles
+            FROM messages
+            WHERE mentions LIKE ? AND mention_roles IS NOT NULL
+            LIMIT 100
         `;
         
         db.all(sql, [`%${memberId}%`], (err, rows) => {
             if (err) {
-                console.error(`[${getFormattedDateTime()}] Error finding roles for member ${memberId}:`, err);
+                console.error(`[${getFormattedDateTime()}] Error finding messages mentioning ${memberId}:`, err);
                 reject(err);
                 return;
             }
             
-            resolve(rows || []);
+            resolve(rows);
         });
     });
 }
 
 /**
- * Fallback method to extract roles from message mentions
+ * Gets role details from the guild_roles table
+ * @param {Object} db - Database connection
+ * @param {String} roleId - Role ID
+ * @returns {Promise<Object|null>} Promise that resolves with role details or null
+ */
+function getRoleDetails(db, roleId) {
+    return new Promise((resolve, reject) => {
+        const sql = `
+            SELECT id, name, color, position
+            FROM guild_roles
+            WHERE id = ?
+        `;
+        
+        db.get(sql, [roleId], (err, row) => {
+            if (err) {
+                console.error(`[${getFormattedDateTime()}] Error getting role details for ${roleId}:`, err);
+                reject(err);
+                return;
+            }
+            
+            resolve(row);
+        });
+    });
+}
+
+/**
+ * Adds a role to a member in the member_roles table
  * @param {Object} db - Database connection
  * @param {String} memberId - Member ID
- * @returns {Promise<Array>} Promise resolving to an array of roles
+ * @param {Object} role - Role details
+ * @param {Number} timestamp - Current timestamp for addedAt field
+ * @returns {Promise} Promise that resolves when the role is added
  */
-async function extractRolesFromMentions(db, memberId) {
-    try {
-        // Get messages that mention the member
-        const messages = await new Promise((resolve, reject) => {
-            db.all(
-                `SELECT mention_roles FROM messages WHERE mentions LIKE ? AND mention_roles IS NOT NULL LIMIT 50`, 
-                [`%${memberId}%`], 
-                (err, rows) => err ? reject(err) : resolve(rows)
-            );
+function addRoleToMember(db, memberId, role, timestamp) {
+    return new Promise((resolve, reject) => {
+        const sql = `
+            INSERT OR IGNORE INTO member_roles (
+                memberId, roleId, roleName, roleColor, rolePosition, addedAt
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        `;
+        
+        db.run(sql, [
+            memberId,
+            role.id,
+            role.name,
+            role.color,
+            role.position,
+            timestamp
+        ], function(err) {
+            if (err) {
+                console.error(`[${getFormattedDateTime()}] Error adding role ${role.name} for member ${memberId}:`, err);
+                reject(err);
+                return;
+            }
+            
+            if (this.changes > 0) {
+                console.log(`[${getFormattedDateTime()}] Added role ${role.name} for left member ${memberId}`);
+            }
+            resolve(this.changes);
         });
-        
-        if (messages.length === 0) {
-            return [];
-        }
-        
-        // Extract role IDs from mentions
-        const roleIds = new Set();
-        for (const message of messages) {
-            try {
-                const roles = JSON.parse(message.mention_roles);
-                if (Array.isArray(roles)) {
-                    roles.forEach(roleId => roleIds.add(roleId));
-                }
-            } catch (e) {
-                // Ignore JSON parse errors
-            }
-        }
-        
-        // Get role details for each ID
-        const roles = [];
-        for (const roleId of roleIds) {
-            try {
-                const role = await new Promise((resolve, reject) => {
-                    db.get(
-                        `SELECT id, name, color, position FROM guild_roles WHERE id = ?`,
-                        [roleId],
-                        (err, row) => err ? reject(err) : resolve(row)
-                    );
-                });
-                
-                if (role) {
-                    roles.push(role);
-                }
-            } catch (e) {
-                // Ignore errors for individual role lookups
-            }
-        }
-        
-        return roles;
-    } catch (error) {
-        console.error(`[${getFormattedDateTime()}] Error extracting roles from mentions for ${memberId}:`, error);
-        return [];
-    }
+    });
 }
 
 // Utility function for formatted date-time
