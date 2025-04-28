@@ -11,7 +11,6 @@ const {
 
 // Import modules
 const exportGuild = require('./exportguild');
-const processData = require('./processData');
 const config = require('./config');
 const channelList = require('./channelList');
 const monitor = require('./monitor');

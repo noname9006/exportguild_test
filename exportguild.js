@@ -6,6 +6,7 @@ const {
 const config = require('./config');
 const monitor = require('./monitor');
 const memberTracker = require('./member-tracker');
+const memberLeft = require('./member-left');
 
 // Parse excluded channels from environment variable or config
 const excludedChannelsArray = config.getConfig('excludedChannels', 'EX_CHANNELS');
@@ -1135,17 +1136,56 @@ try {
   
   const memberResult = await memberTracker.fetchAndStoreMembersForGuild(guild, memberStatusMessage);
   
-  if (memberResult.success) {
-    console.log(`Successfully stored member data: ${memberResult.memberCount} members with ${memberResult.roleCount} roles`);
-    
-    // Store metadata about member export
-    await monitor.storeGuildMetadata('members_exported', memberResult.memberCount.toString());
-    await monitor.storeGuildMetadata('member_roles_exported', memberResult.roleCount.toString());
-    await monitor.storeGuildMetadata('member_export_completed_at', new Date().toISOString());
-  } else {
-    console.error('Error during member export:', memberResult.error);
-    await monitor.storeGuildMetadata('member_export_error', memberResult.error);
+if (memberResult.success) {
+  console.log(`Successfully stored member data: ${memberResult.memberCount} members with ${memberResult.roleCount || 0} roles`);
+  
+  // Store metadata about member export - Add null checks
+  await monitor.storeGuildMetadata('members_exported', memberResult.memberCount.toString());
+  
+  // Fix for roleCount being undefined
+  const roleCount = memberResult.roleCount !== undefined ? memberResult.roleCount.toString() : '0';
+  await monitor.storeGuildMetadata('member_roles_exported', roleCount);
+  
+  await monitor.storeGuildMetadata('member_export_completed_at', new Date().toISOString());
+  
+  // Now proceed with left members processing
+  console.log('Processing members who have left the guild...');
+  try {
+    const leftMembersResult = await memberLeft.processLeftMembers(guild);
+    if (leftMembersResult.success) {
+      console.log(`Successfully processed left members: ${leftMembersResult.addedCount} former members added to database`);
+      await monitor.storeGuildMetadata('left_members_processed', leftMembersResult.addedCount.toString());
+      await monitor.storeGuildMetadata('left_members_processed_at', new Date().toISOString());
+    } else {
+      console.error('Error during left member processing:', leftMembersResult.error);
+      await monitor.storeGuildMetadata('left_member_processing_error', leftMembersResult.error);
+    }
+  } catch (leftMemberError) {
+    console.error('Error during left member processing:', leftMemberError);
+    await monitor.storeGuildMetadata('left_member_processing_error', leftMemberError.message);
   }
+} else {
+  console.error('Error during member export:', memberResult.error);
+  await monitor.storeGuildMetadata('member_export_error', memberResult.error);
+}
+  
+  // ADD THE NEW CODE HERE - Process left members after regular member processing
+  console.log('Processing members who have left the guild...');
+  try {
+    const leftMembersResult = await memberLeft.processLeftMembers(guild);
+    if (leftMembersResult.success) {
+      console.log(`Successfully processed left members: ${leftMembersResult.addedCount} former members added to database`);
+      await monitor.storeGuildMetadata('left_members_processed', leftMembersResult.addedCount.toString());
+      await monitor.storeGuildMetadata('left_members_processed_at', new Date().toISOString());
+    } else {
+      console.error('Error during left member processing:', leftMembersResult.error);
+      await monitor.storeGuildMetadata('left_member_processing_error', leftMembersResult.error);
+    }
+  } catch (leftMemberError) {
+    console.error('Error during left member processing:', leftMemberError);
+    await monitor.storeGuildMetadata('left_member_processing_error', leftMemberError.message);
+  }
+  
 } catch (memberError) {
   console.error('Error during member data export:', memberError);
   await monitor.storeGuildMetadata('member_export_error', memberError.message);
